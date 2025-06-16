@@ -127,12 +127,8 @@ class ErnieAttention(nn.Module):
         super().__init__()
         self.layer_idx = extract_layer_index(prefix)
         print("in ernie self.layer_idx: ", self.layer_idx)
-        import pdb; pdb.set_trace()
-        
         self.hidden_size = hidden_size
-        self.no_rope_layers = config.no_rope_layers
-        self.nope = self.no_rope_layers[self.layer_idx] == 0
-        self.use_qk_norm = config.use_qk_norm and not self.nope
+        self.use_qk_norm = False
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
@@ -152,8 +148,7 @@ class ErnieAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         # TODO: attn_temperature_tuning should be a bool in huggingface
-        self.attn_temperature_tuning = self.nope and \
-            config.attn_temperature_tuning > 0
+        self.attn_temperature_tuning = False
 
         self.floor_scale = getattr(config, "floor_scale", 8192.0)
         self.attn_scale = getattr(config, "attn_scale", 0.1)
@@ -195,7 +190,7 @@ class ErnieAttention(nn.Module):
             base=int(rope_theta),
             rope_scaling=rope_scaling if rope_scaling != "default" else None,
             is_neox_style=is_neox_style,
-        ) if not self.nope else None
+        )
 
         self.attn = Attention(
             self.num_heads,
@@ -205,7 +200,7 @@ class ErnieAttention(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             per_layer_sliding_window=None,
-            use_irope=not self.nope,
+            use_irope=False,
             prefix=f"{prefix}.attn",
         )
 
