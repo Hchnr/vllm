@@ -126,6 +126,9 @@ class ErnieAttention(nn.Module):
                  prefix: str = "") -> None:
         super().__init__()
         self.layer_idx = extract_layer_index(prefix)
+        print("in ernie self.layer_idx: ", self.layer_idx)
+        import pdb; pdb.set_trace()
+        
         self.hidden_size = hidden_size
         self.no_rope_layers = config.no_rope_layers
         self.nope = self.no_rope_layers[self.layer_idx] == 0
