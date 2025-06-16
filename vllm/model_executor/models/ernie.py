@@ -57,7 +57,7 @@ from .utils import (PPMissingLayer, is_pp_missing_parameter,
                     maybe_prefix)
 
 
-class Ernie45MLP(nn.Module):
+class ErnieMLP(nn.Module):
 
     def __init__(
         self,
@@ -92,7 +92,7 @@ class Ernie45MLP(nn.Module):
         return x
 
 
-class Ernie45MoE(nn.Module):
+class ErnieMoE(nn.Module):
 
     def __init__(
         self,
@@ -138,7 +138,7 @@ class Ernie45MoE(nn.Module):
         if config.n_shared_experts is not None:
             intermediate_size = (config.moe_intermediate_size *
                                  config.n_shared_experts)
-            self.shared_experts = Ernie45MLP(
+            self.shared_experts = ErnieMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
@@ -162,7 +162,7 @@ class Ernie45MoE(nn.Module):
                 router_logits=router_logits) * self.routed_scaling_factor
         else:
             # Fix FP16 overflow
-            # See Ernie45DecoderLayer for more details.
+            # See ErnieDecoderLayer for more details.
             final_hidden_states = self.experts(hidden_states=hidden_states,
                                                router_logits=router_logits)
         if shared_output is not None:
@@ -170,7 +170,7 @@ class Ernie45MoE(nn.Module):
                 final_hidden_states = final_hidden_states + shared_output
             else:
                 # Fix FP16 overflow
-                # See Ernie45DecoderLayer for more details.
+                # See ErnieDecoderLayer for more details.
                 final_hidden_states = final_hidden_states + shared_output \
                     * (1. / self.routed_scaling_factor)
 
@@ -189,7 +189,7 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
-class Ernie45Attention(nn.Module):
+class ErnieAttention(nn.Module):
 
     def __init__(
         self,
@@ -335,166 +335,7 @@ class Ernie45Attention(nn.Module):
         return output
 
 
-class Ernie45MLAAttention(nn.Module):
-    """
-    Main reference: Ernie45 paper, and FlashInfer Implementation
-    (https://arxiv.org/abs/2405.04434 and https://github.com/flashinfer-ai/flashinfer/pull/551).
-    
-    For more info see MLACommonImpl in: vllm/attention/backends/mla/utils.py
-    """
-
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        hidden_size: int,
-        num_heads: int,
-        qk_nope_head_dim: int,
-        qk_rope_head_dim: int,
-        v_head_dim: int,
-        q_lora_rank: Optional[int],
-        kv_lora_rank: int,
-        rope_theta: float = 10000,
-        rope_scaling: Optional[dict[str, Any]] = None,
-        max_position_embeddings: int = 8192,
-        cache_config: Optional[CacheConfig] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.qk_nope_head_dim = qk_nope_head_dim
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
-        self.v_head_dim = v_head_dim
-
-        self.q_lora_rank = q_lora_rank
-        self.kv_lora_rank = kv_lora_rank
-
-        self.num_heads = num_heads
-        tp_size = get_tensor_model_parallel_world_size()
-        assert num_heads % tp_size == 0
-        self.num_local_heads = num_heads // tp_size
-
-        self.scaling = self.qk_head_dim**-0.5
-        self.rope_theta = rope_theta
-        self.max_position_embeddings = max_position_embeddings
-
-        if self.q_lora_rank is not None:
-            self.q_a_proj = ReplicatedLinear(self.hidden_size,
-                                             self.q_lora_rank,
-                                             bias=False,
-                                             quant_config=quant_config,
-                                             prefix=f"{prefix}.q_a_proj")
-            self.q_a_layernorm = RMSNorm(self.q_lora_rank,
-                                         eps=config.rms_norm_eps)
-            self.q_b_proj = ColumnParallelLinear(q_lora_rank,
-                                                 self.num_heads *
-                                                 self.qk_head_dim,
-                                                 bias=False,
-                                                 quant_config=quant_config,
-                                                 prefix=f"{prefix}.q_b_proj")
-        else:
-            self.q_proj = ColumnParallelLinear(self.hidden_size,
-                                               self.num_heads *
-                                               self.qk_head_dim,
-                                               bias=False,
-                                               quant_config=quant_config,
-                                               prefix=f"{prefix}.q_proj")
-
-        self.kv_a_proj_with_mqa = ReplicatedLinear(
-            self.hidden_size,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.kv_a_proj_with_mqa")
-        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank,
-                                      eps=config.rms_norm_eps)
-        self.kv_b_proj = ColumnParallelLinear(
-            self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.kv_b_proj")
-        self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
-                                        self.hidden_size,
-                                        bias=False,
-                                        quant_config=quant_config,
-                                        prefix=f"{prefix}.o_proj")
-
-        if rope_scaling:
-            rope_scaling["rope_type"] = 'deepseek_yarn'
-        self.rotary_emb = get_rope(qk_rope_head_dim,
-                                   rotary_dim=qk_rope_head_dim,
-                                   max_position=max_position_embeddings,
-                                   base=rope_theta,
-                                   rope_scaling=rope_scaling,
-                                   is_neox_style=False)
-        if rope_scaling:
-            mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
-            scaling_factor = rope_scaling["factor"]
-            mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-            self.scaling = self.scaling * mscale * mscale
-
-        # In the MLA backend, kv_cache includes both k_c and
-        # pe (i.e. decoupled position embeddings). In particular,
-        # the concat_and_cache_mla op requires
-        #     k_c.size(1) + k_pe.size(1) == kv_cache.size(2)
-        # i.e.
-        #     kv_lora_rank + qk_rope_head_dim == head_size
-        self.mla_attn = Attention(
-            num_heads=self.num_local_heads,
-            head_size=self.kv_lora_rank + self.qk_rope_head_dim,
-            scale=self.scaling,
-            num_kv_heads=1,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.attn",
-            use_mla=True,
-            # MLA Args
-            q_lora_rank=self.q_lora_rank,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            qk_head_dim=self.qk_head_dim,
-            v_head_dim=self.v_head_dim,
-            kv_b_proj=self.kv_b_proj,
-        )
-
-        self.prefix = prefix
-        self.debug_layer_idx = int(self.prefix.split(".")[-2])
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.q_lora_rank is not None:
-            q_c = self.q_a_proj(hidden_states)[0]
-            q_c = self.q_a_layernorm(q_c)
-            q = self.q_b_proj(q_c)[0]
-        else:
-            q = self.q_proj(hidden_states)[0]
-        kv_c, k_pe = self.kv_a_proj_with_mqa(hidden_states)[0].split(
-            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv_c_normed = self.kv_a_layernorm(kv_c.contiguous())
-
-        q = q.view(-1, self.num_local_heads, self.qk_head_dim)
-        # Add head dim of 1 to k_pe
-        k_pe = k_pe.unsqueeze(1)
-
-        q[..., self.qk_nope_head_dim:], k_pe = self.rotary_emb(
-            positions, q[..., self.qk_nope_head_dim:], k_pe)
-
-        attn_out = self.mla_attn(
-            q,
-            kv_c_normed,
-            k_pe,
-            output_shape=(hidden_states.shape[0],
-                          self.num_local_heads * self.v_head_dim))
-        return self.o_proj(attn_out)[0]
-
-
-class Ernie45DecoderLayer(nn.Module):
+class ErnieDecoderLayer(nn.Module):
 
     def __init__(
         self,
@@ -514,10 +355,8 @@ class Ernie45DecoderLayer(nn.Module):
         # with the layer's index.
         layer_idx = int(prefix.split(sep='.')[-1])
         self.layer_idx = layer_idx
-        if model_config.use_mla:
-            attn_cls = Ernie45MLAAttention
-        else:
-            attn_cls = Ernie45Attention
+        
+        attn_cls = ErnieAttention
         self.self_attn = attn_cls(
             config=config,
             hidden_size=self.hidden_size,
@@ -539,13 +378,13 @@ class Ernie45DecoderLayer(nn.Module):
         if (config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
                 and layer_idx % config.moe_layer_freq == 0):
-            self.mlp = Ernie45MoE(
+            self.mlp = ErnieMoE(
                 config=config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
         else:
-            self.mlp = Ernie45MLP(
+            self.mlp = ErnieMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
@@ -592,19 +431,19 @@ class Ernie45DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
 
         if isinstance(self.mlp,
-                      Ernie45MLP) and hidden_states.dtype == torch.float16:
+                      ErnieMLP) and hidden_states.dtype == torch.float16:
             # Fix FP16 overflow
-            # Scaling the Ernie45MLP output, it is the input of
+            # Scaling the ErnieMLP output, it is the input of
             # input_layernorm of next decoder layer.
-            # The scaling of Ernie45MOE output would be done in the forward
-            # of Ernie45MOE
+            # The scaling of ErnieMOE output would be done in the forward
+            # of ErnieMOE
             hidden_states *= 1. / self.routed_scaling_factor
 
         return hidden_states, residual
 
 
 @support_torch_compile
-class Ernie45Model(nn.Module):
+class ErnieModel(nn.Module):
 
     fall_back_to_pt_during_load = False
 
@@ -630,7 +469,7 @@ class Ernie45Model(nn.Module):
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: Ernie45DecoderLayer(
+            lambda prefix: ErnieDecoderLayer(
                 config,
                 prefix,
                 model_config=model_config,
@@ -681,7 +520,7 @@ class Ernie45Model(nn.Module):
         return hidden_states
 
 
-class Ernie45ForCausalLM(nn.Module, SupportsPP):
+class ErnieForCausalLM(nn.Module, SupportsPP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -689,7 +528,7 @@ class Ernie45ForCausalLM(nn.Module, SupportsPP):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
-        self.model = Ernie45Model(vllm_config=vllm_config,
+        self.model = ErnieModel(vllm_config=vllm_config,
                                      prefix=maybe_prefix(prefix, "model"))
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(config.vocab_size,
@@ -827,7 +666,7 @@ class Ernie45ForCausalLM(nn.Module, SupportsPP):
         return loaded_params
 
 
-class ErnieForCausalLM(Ernie45ForCausalLM):
+class ErnieForCausalLM(ErnieForCausalLM):
     pass
 
 
