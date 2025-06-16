@@ -1,15 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
-# Adapted from
-# https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/llama/modeling_llama.py
-# Copyright 2023 The vLLM team.
-# Copyright 2023 DeepSeek-AI and the HuggingFace Inc. team. All rights reserved.
 #
-# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
-# and OPT implementations in this library. It has been modified from its
-# original forms to accommodate minor architectural differences compared
-# to GPT-NeoX and OPT used by the Meta AI team that trained the model.
+# Copyright 2025 the Ernie, Meta Inc., vLLM, and HuggingFace Inc. team.
+# All rights reserved.
+#
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,548 +16,293 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inference-only Ernie45-Turbo model."""
+"""Inference-only LLaMA model compatible with HuggingFace weights."""
 from collections.abc import Iterable
-from typing import Any, Optional, Union
+from typing import Any, Optional
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import ErnieTextConfig
 
 from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, ModelConfig, VllmConfig
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.config import CacheConfig, VllmConfig
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (ColumnParallelLinear,
-                                               MergedColumnParallelLinear,
+from vllm.model_executor.layers.linear import (QKVParallelLinear,
                                                ReplicatedLinear,
                                                RowParallelLinear)
-from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead, VocabParallelEmbedding)
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader, maybe_remap_kv_scale_name)
-from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.sequence import IntermediateTensors
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from .interfaces import SupportsPP
-from .utils import (PPMissingLayer, is_pp_missing_parameter,
-                    make_empty_intermediate_tensors_factory, make_layers,
-                    maybe_prefix)
+from .llama import LlamaForCausalLM, LlamaMLP, LlamaModel
+from .utils import (AutoWeightsLoader, extract_layer_index, fast_topk,
+                    is_pp_missing_parameter)
 
 
-class Ernie45MLP(nn.Module):
+class ErnieMoE(nn.Module):
 
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
-        quant_config: Optional[QuantizationConfig] = None,
-        reduce_results: bool = True,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, [intermediate_size] * 2,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj")
-        self.down_proj = RowParallelLinear(intermediate_size,
-                                           hidden_size,
-                                           bias=False,
-                                           quant_config=quant_config,
-                                           reduce_results=reduce_results,
-                                           prefix=f"{prefix}.down_proj")
-        if hidden_act != "silu":
-            raise ValueError(f"Unsupported activation: {hidden_act}. "
-                             "Only silu is supported for now.")
-        self.act_fn = SiluAndMul()
+    @staticmethod
+    def custom_routing_function(
+        hidden_states: torch.Tensor,
+        gating_output: torch.Tensor,
+        topk: int,
+        renormalize: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        router_scores, router_indices = fast_topk(gating_output, topk, dim=-1)
+        # pseudo-standard is that the router scores are floats
+        router_scores = torch.sigmoid(router_scores.float())
+        return (router_scores, router_indices.to(torch.int32))
 
-    def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
-
-
-class Ernie45MoE(nn.Module):
-
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ):
+    def __init__(self,
+                 config: ErnieTextConfig,
+                 quant_config: Optional[QuantizationConfig] = None,
+                 prefix: str = ""):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.routed_scaling_factor = config.routed_scaling_factor
-        self.n_shared_experts = config.n_shared_experts
+        self.top_k = config.num_experts_per_tok
 
-        if config.hidden_act != "silu":
-            raise ValueError(f"Unsupported activation: {config.hidden_act}. "
-                             "Only silu is supported for now.")
-
-        self.gate = ReplicatedLinear(config.hidden_size,
-                                     config.n_routed_experts,
-                                     bias=False,
-                                     quant_config=None,
-                                     prefix=f"{prefix}.gate")
-        if config.topk_method == "noaux_tc":
-            self.gate.e_score_correction_bias = nn.Parameter(
-                torch.empty(config.n_routed_experts))
-        else:
-            self.gate.e_score_correction_bias = None
+        intermediate_size_moe = config.intermediate_size
+        self.router = ReplicatedLinear(config.hidden_size,
+                                       config.num_local_experts,
+                                       bias=False,
+                                       quant_config=None,
+                                       prefix=f"{prefix}.router")
 
         self.experts = FusedMoE(
-            num_experts=config.n_routed_experts,
+            num_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
+            custom_routing_function=ErnieMoE.custom_routing_function,
+            intermediate_size=intermediate_size_moe,
+            apply_router_weight_on_input=True,
             reduce_results=False,
-            renormalize=config.norm_topk_prob,
+            renormalize=False,
             quant_config=quant_config,
-            use_grouped_topk=True,
-            num_expert_group=config.n_group,
-            topk_group=config.topk_group,
-            prefix=f"{prefix}.experts",
-            scoring_func=config.scoring_func,
-            e_score_correction_bias=self.gate.e_score_correction_bias)
+            prefix=f"{prefix}.experts")
 
-        if config.n_shared_experts is not None:
-            intermediate_size = (config.moe_intermediate_size *
-                                 config.n_shared_experts)
-            self.shared_experts = Ernie45MLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=intermediate_size,
-                hidden_act=config.hidden_act,
-                quant_config=quant_config,
-                reduce_results=self.experts.must_reduce_shared_expert_outputs(
-                ),
-                prefix=f"{prefix}.shared_experts",
-            )
+        self.shared_expert = LlamaMLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=intermediate_size_moe,
+            hidden_act="silu",
+            quant_config=quant_config,
+            bias=False,
+            prefix=f"{prefix}.shared_expert",
+            reduce_results=self.experts.must_reduce_shared_expert_outputs(),
+        )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
-        if self.n_shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-
-        if hidden_states.dtype != torch.float16:
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits) * self.routed_scaling_factor
-        else:
-            # Fix FP16 overflow
-            # See Ernie45DecoderLayer for more details.
-            final_hidden_states = self.experts(hidden_states=hidden_states,
-                                               router_logits=router_logits)
-        if shared_output is not None:
-            if hidden_states.dtype != torch.float16:
-                final_hidden_states = final_hidden_states + shared_output
-            else:
-                # Fix FP16 overflow
-                # See Ernie45DecoderLayer for more details.
-                final_hidden_states = final_hidden_states + shared_output \
-                    * (1. / self.routed_scaling_factor)
+    def forward(self, hidden_states):
+        router_logits, _ = self.router(hidden_states)
+        shared_out = self.shared_expert(hidden_states)
+        routed_out = self.experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+        )
+        experts_out = routed_out + shared_out
 
         if self.tp_size > 1:
-            final_hidden_states = (
-                self.experts.maybe_all_reduce_tensor_model_parallel(
-                    final_hidden_states))
+            experts_out = self.experts.maybe_all_reduce_tensor_model_parallel(
+                experts_out)
 
-        return final_hidden_states.view(num_tokens, hidden_dim)
-
-
-def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
-    import math
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
+        return experts_out
 
 
-class Ernie45Attention(nn.Module):
+class ErnieAttention(nn.Module):
 
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        hidden_size: int,
-        num_heads: int,
-        qk_nope_head_dim: int,
-        qk_rope_head_dim: int,
-        v_head_dim: int,
-        q_lora_rank: int,
-        kv_lora_rank: int,
-        rope_theta: float = 10000,
-        rope_scaling: Optional[dict[str, Any]] = None,
-        max_position_embeddings: int = 8192,
-        cache_config: Optional[CacheConfig] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
+    def __init__(self,
+                 config: ErnieTextConfig,
+                 hidden_size: int,
+                 num_heads: int,
+                 num_kv_heads: int,
+                 rope_theta: float = 10000,
+                 rope_scaling: Optional[dict[str, Any]] = None,
+                 max_position_embeddings: int = 8192,
+                 quant_config: Optional[QuantizationConfig] = None,
+                 bias: bool = False,
+                 bias_o_proj: bool = False,
+                 cache_config: Optional[CacheConfig] = None,
+                 prefix: str = "") -> None:
         super().__init__()
+        self.layer_idx = extract_layer_index(prefix)
         self.hidden_size = hidden_size
-        self.qk_nope_head_dim = qk_nope_head_dim
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
-        self.v_head_dim = v_head_dim
-        self.q_lora_rank = q_lora_rank
-        self.kv_lora_rank = kv_lora_rank
-        self.num_heads = num_heads
+        self.no_rope_layers = config.no_rope_layers
+        self.nope = self.no_rope_layers[self.layer_idx] == 0
+        self.use_qk_norm = config.use_qk_norm and not self.nope
         tp_size = get_tensor_model_parallel_world_size()
-        assert num_heads % tp_size == 0
-        self.num_local_heads = num_heads // tp_size
-        self.scaling = self.qk_head_dim**-0.5
+        self.total_num_heads = num_heads
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
+        self.total_num_kv_heads = num_kv_heads
+        if self.total_num_kv_heads >= tp_size:
+            # Number of KV heads is greater than TP size, so we partition
+            # the KV heads across multiple tensor parallel GPUs.
+            assert self.total_num_kv_heads % tp_size == 0
+        else:
+            # Number of KV heads is less than TP size, so we replicate
+            # the KV heads across multiple tensor parallel GPUs.
+            assert tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.head_dim = config.head_dim
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = self.head_dim**-0.5
+        # TODO: attn_temperature_tuning should be a bool in huggingface
+        self.attn_temperature_tuning = self.nope and \
+            config.attn_temperature_tuning > 0
+
+        self.floor_scale = getattr(config, "floor_scale", 8192.0)
+        self.attn_scale = getattr(config, "attn_scale", 0.1)
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-
-        if self.q_lora_rank is not None:
-            self.q_a_proj = ReplicatedLinear(self.hidden_size,
-                                             self.q_lora_rank,
-                                             bias=False,
-                                             quant_config=quant_config,
-                                             prefix=f"{prefix}.q_a_proj")
-            self.q_a_layernorm = RMSNorm(self.q_lora_rank,
-                                         eps=config.rms_norm_eps)
-            self.q_b_proj = ColumnParallelLinear(q_lora_rank,
-                                                 self.num_heads *
-                                                 self.qk_head_dim,
-                                                 bias=False,
-                                                 quant_config=quant_config,
-                                                 prefix=f"{prefix}.q_b_proj")
-        else:
-            self.q_proj = ColumnParallelLinear(self.hidden_size,
-                                               self.num_heads *
-                                               self.qk_head_dim,
-                                               bias=False,
-                                               quant_config=quant_config,
-                                               prefix=f"{prefix}.q_proj")
-
-        self.kv_a_proj_with_mqa = ReplicatedLinear(
-            self.hidden_size,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-            bias=False,
+        self.n_rep = self.num_heads // self.num_kv_heads
+        self.qk_norm = RMSNorm(
+            hidden_size=self.head_dim,
+            eps=config.rms_norm_eps,
+            has_weight=False,
+            dtype=torch.float32,
+        ) if self.use_qk_norm else None
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=self.total_num_heads,
+            total_num_kv_heads=self.total_num_kv_heads,
+            bias=bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.kv_a_proj_with_mqa")
-        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank,
-                                      eps=config.rms_norm_eps)
-        self.kv_b_proj = ColumnParallelLinear(
-            self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=False,
+            prefix=f"{prefix}.qkv_proj",
+        )
+
+        self.o_proj = RowParallelLinear(
+            input_size=self.total_num_heads * self.head_dim,
+            output_size=hidden_size,
+            bias=bias_o_proj,
             quant_config=quant_config,
-            prefix=f"{prefix}.kv_b_proj")
-        # O projection.
-        self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
-                                        self.hidden_size,
-                                        bias=False,
-                                        quant_config=quant_config,
-                                        prefix=f"{prefix}.o_proj")
-        if rope_scaling:
-            rope_scaling["rope_type"] = 'deepseek_yarn'
+            prefix=f"{prefix}.o_proj",
+        )
+        is_neox_style = True
+        is_gguf = quant_config and quant_config.get_name() == "gguf"
+        if is_gguf and config.model_type == "llama":
+            is_neox_style = False
 
-        self.rotary_emb = get_rope(qk_rope_head_dim,
-                                   rotary_dim=qk_rope_head_dim,
-                                   max_position=max_position_embeddings,
-                                   base=rope_theta,
-                                   rope_scaling=rope_scaling,
-                                   is_neox_style=False)
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=max_position_embeddings,
+            base=int(rope_theta),
+            rope_scaling=rope_scaling if rope_scaling != "default" else None,
+            is_neox_style=is_neox_style,
+        ) if not self.nope else None
 
-        if rope_scaling:
-            mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
-            scaling_factor = rope_scaling["factor"]
-            mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-            self.scaling = self.scaling * mscale * mscale
+        self.attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            per_layer_sliding_window=None,
+            use_irope=not self.nope,
+            prefix=f"{prefix}.attn",
+        )
 
-        self.attn = Attention(self.num_local_heads,
-                              self.qk_head_dim,
-                              self.scaling,
-                              num_kv_heads=self.num_local_heads,
-                              cache_config=cache_config,
-                              quant_config=quant_config,
-                              prefix=f"{prefix}.attn")
+    def _get_attn_scale(self, positions: torch.Tensor) -> torch.Tensor:
+        floor = torch.floor((positions + 1.0) / self.floor_scale)
+        attn_scale = torch.log(floor + 1.0) * self.attn_scale + 1.0
+
+        return attn_scale.unsqueeze(-1)
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        if self.q_lora_rank is not None:
-            q = self.q_a_proj(hidden_states)[0]
-            q = self.q_a_layernorm(q)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads,
-                                         self.qk_head_dim)
-        else:
-            q = self.q_proj(hidden_states)[0].view(-1, self.num_local_heads,
-                                                   self.qk_head_dim)
-        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim],
-                               dim=-1)
-        latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
-        kv_a, _ = latent_cache.split(
-            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        latent_cache = latent_cache.unsqueeze(1)
-        kv_a = self.kv_a_layernorm(kv_a.contiguous())
-        kv = self.kv_b_proj(kv_a)[0]
-        kv = kv.view(-1, self.num_local_heads,
-                     self.qk_nope_head_dim + self.v_head_dim)
-        k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        k_pe = latent_cache[:, :, self.kv_lora_rank:]
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        if self.rotary_emb is not None:
+            q, k = self.rotary_emb(positions, q, k)
+        if self.qk_norm is not None:
+            q = q.reshape(-1, self.num_heads, self.head_dim)
+            q = self.qk_norm(q.float()).reshape(-1, self.q_size).to(q.dtype)
+            k = k.reshape(-1, self.num_kv_heads, self.head_dim)
+            k = self.qk_norm(k.float()).reshape(-1, self.kv_size).to(k.dtype)
 
-        q[..., self.qk_nope_head_dim:] = q_pe
-        k = torch.empty_like(q)
-        k[..., :self.qk_nope_head_dim] = k_nope
-        k[..., self.qk_nope_head_dim:] = k_pe
-        # padding value to qk_head_dim for alignment
-        v = torch.nn.functional.pad(
-            v, [0, self.qk_head_dim - self.v_head_dim],
-            value=0).view(-1, self.num_local_heads * self.qk_head_dim)
+        # We are applying temperature tuning (https://arxiv.org/abs/2501.19399)
+        # to NoPE layers, where the inference-time temperature tuning function
+        # is customized to not affect short context
+        # while working at very long context
+        # https://arxiv.org/abs/2501.19399
+        #
+        # We should apply temperature tuning between (after) rotary / QK norm
+        # and (before) attention.
+        if self.attn_temperature_tuning and self.nope:
+            attn_scale = self._get_attn_scale(positions)
+            q = (q * attn_scale).to(q.dtype)
         attn_output = self.attn(q, k, v)
-        attn_output = attn_output.view(
-            -1, self.num_local_heads,
-            self.qk_head_dim)[..., :self.v_head_dim].reshape(
-                -1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
         return output
 
 
-class Ernie45MLAAttention(nn.Module):
-    """
-    Main reference: Ernie45 paper, and FlashInfer Implementation
-    (https://arxiv.org/abs/2405.04434 and https://github.com/flashinfer-ai/flashinfer/pull/551).
-    
-    For more info see MLACommonImpl in: vllm/attention/backends/mla/utils.py
-    """
+class ErnieDecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: PretrainedConfig,
-        hidden_size: int,
-        num_heads: int,
-        qk_nope_head_dim: int,
-        qk_rope_head_dim: int,
-        v_head_dim: int,
-        q_lora_rank: Optional[int],
-        kv_lora_rank: int,
-        rope_theta: float = 10000,
-        rope_scaling: Optional[dict[str, Any]] = None,
-        max_position_embeddings: int = 8192,
+        config: ErnieTextConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.hidden_size = hidden_size
-        self.qk_nope_head_dim = qk_nope_head_dim
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
-        self.v_head_dim = v_head_dim
 
-        self.q_lora_rank = q_lora_rank
-        self.kv_lora_rank = kv_lora_rank
-
-        self.num_heads = num_heads
-        tp_size = get_tensor_model_parallel_world_size()
-        assert num_heads % tp_size == 0
-        self.num_local_heads = num_heads // tp_size
-
-        self.scaling = self.qk_head_dim**-0.5
-        self.rope_theta = rope_theta
-        self.max_position_embeddings = max_position_embeddings
-
-        if self.q_lora_rank is not None:
-            self.q_a_proj = ReplicatedLinear(self.hidden_size,
-                                             self.q_lora_rank,
-                                             bias=False,
-                                             quant_config=quant_config,
-                                             prefix=f"{prefix}.q_a_proj")
-            self.q_a_layernorm = RMSNorm(self.q_lora_rank,
-                                         eps=config.rms_norm_eps)
-            self.q_b_proj = ColumnParallelLinear(q_lora_rank,
-                                                 self.num_heads *
-                                                 self.qk_head_dim,
-                                                 bias=False,
-                                                 quant_config=quant_config,
-                                                 prefix=f"{prefix}.q_b_proj")
-        else:
-            self.q_proj = ColumnParallelLinear(self.hidden_size,
-                                               self.num_heads *
-                                               self.qk_head_dim,
-                                               bias=False,
-                                               quant_config=quant_config,
-                                               prefix=f"{prefix}.q_proj")
-
-        self.kv_a_proj_with_mqa = ReplicatedLinear(
-            self.hidden_size,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.kv_a_proj_with_mqa")
-        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank,
-                                      eps=config.rms_norm_eps)
-        self.kv_b_proj = ColumnParallelLinear(
-            self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.kv_b_proj")
-        self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
-                                        self.hidden_size,
-                                        bias=False,
-                                        quant_config=quant_config,
-                                        prefix=f"{prefix}.o_proj")
-
-        if rope_scaling:
-            rope_scaling["rope_type"] = 'deepseek_yarn'
-        self.rotary_emb = get_rope(qk_rope_head_dim,
-                                   rotary_dim=qk_rope_head_dim,
-                                   max_position=max_position_embeddings,
-                                   base=rope_theta,
-                                   rope_scaling=rope_scaling,
-                                   is_neox_style=False)
-        if rope_scaling:
-            mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
-            scaling_factor = rope_scaling["factor"]
-            mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-            self.scaling = self.scaling * mscale * mscale
-
-        # In the MLA backend, kv_cache includes both k_c and
-        # pe (i.e. decoupled position embeddings). In particular,
-        # the concat_and_cache_mla op requires
-        #     k_c.size(1) + k_pe.size(1) == kv_cache.size(2)
-        # i.e.
-        #     kv_lora_rank + qk_rope_head_dim == head_size
-        self.mla_attn = Attention(
-            num_heads=self.num_local_heads,
-            head_size=self.kv_lora_rank + self.qk_rope_head_dim,
-            scale=self.scaling,
-            num_kv_heads=1,
-            cache_config=cache_config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.attn",
-            use_mla=True,
-            # MLA Args
-            q_lora_rank=self.q_lora_rank,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            qk_head_dim=self.qk_head_dim,
-            v_head_dim=self.v_head_dim,
-            kv_b_proj=self.kv_b_proj,
-        )
-
-        self.prefix = prefix
-        self.debug_layer_idx = int(self.prefix.split(".")[-2])
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.q_lora_rank is not None:
-            q_c = self.q_a_proj(hidden_states)[0]
-            q_c = self.q_a_layernorm(q_c)
-            q = self.q_b_proj(q_c)[0]
-        else:
-            q = self.q_proj(hidden_states)[0]
-        kv_c, k_pe = self.kv_a_proj_with_mqa(hidden_states)[0].split(
-            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        kv_c_normed = self.kv_a_layernorm(kv_c.contiguous())
-
-        q = q.view(-1, self.num_local_heads, self.qk_head_dim)
-        # Add head dim of 1 to k_pe
-        k_pe = k_pe.unsqueeze(1)
-
-        q[..., self.qk_nope_head_dim:], k_pe = self.rotary_emb(
-            positions, q[..., self.qk_nope_head_dim:], k_pe)
-
-        attn_out = self.mla_attn(
-            q,
-            kv_c_normed,
-            k_pe,
-            output_shape=(hidden_states.shape[0],
-                          self.num_local_heads * self.v_head_dim))
-        return self.o_proj(attn_out)[0]
-
-
-class Ernie45DecoderLayer(nn.Module):
-
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        prefix: str,
-        model_config: ModelConfig,
-        cache_config: Optional[CacheConfig] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-    ) -> None:
-        super().__init__()
+        self.layer_idx = extract_layer_index(prefix)
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings",
-                                          8192)
-        # DecoderLayers are created with `make_layers` which passes the prefix
-        # with the layer's index.
-        layer_idx = int(prefix.split(sep='.')[-1])
-        self.layer_idx = layer_idx
-        if model_config.use_mla:
-            attn_cls = Ernie45MLAAttention
-        else:
-            attn_cls = Ernie45Attention
-        self.self_attn = attn_cls(
+        rope_theta = config.rope_theta
+        rope_scaling = config.rope_scaling
+        max_position_embeddings = config.max_position_embeddings
+
+        self.self_attn = ErnieAttention(
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
-            qk_nope_head_dim=config.qk_nope_head_dim,
-            qk_rope_head_dim=config.qk_rope_head_dim,
-            v_head_dim=config.v_head_dim,
-            q_lora_rank=config.q_lora_rank
-            if hasattr(config, "q_lora_rank") else None,
-            kv_lora_rank=config.kv_lora_rank,
+            num_kv_heads=config.num_key_value_heads,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
-            cache_config=cache_config,
             quant_config=quant_config,
+            bias=False,
+            bias_o_proj=False,
+            cache_config=cache_config,
             prefix=f"{prefix}.self_attn",
         )
-
-        if (config.n_routed_experts is not None
-                and layer_idx >= config.first_k_dense_replace
-                and layer_idx % config.moe_layer_freq == 0):
-            self.mlp = Ernie45MoE(
+        is_moe_layer = config.interleave_moe_layer_step > 0 and (
+            self.layer_idx + 1) % config.interleave_moe_layer_step == 0
+        if is_moe_layer:
+            self.feed_forward = ErnieMoE(
                 config=config,
                 quant_config=quant_config,
-                prefix=f"{prefix}.mlp",
+                prefix=f"{prefix}.feed_forward",
             )
         else:
-            self.mlp = Ernie45MLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=config.intermediate_size,
-                hidden_act=config.hidden_act,
+            self.feed_forward = LlamaMLP(
+                hidden_size=self.hidden_size,
+                intermediate_size=config.intermediate_size_mlp,
+                hidden_act="silu",
                 quant_config=quant_config,
-                prefix=f"{prefix}.mlp",
+                bias=False,
+                prefix=f"{prefix}.feed_forward",
             )
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
-        self.routed_scaling_factor = config.routed_scaling_factor
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -571,273 +310,223 @@ class Ernie45DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-        )
-
-        if hidden_states.dtype == torch.float16:
-            # Fix FP16 overflow
-            # We scale both hidden_states and residual before
-            # rmsnorm, and rmsnorm result would not affect by scale.
-            hidden_states *= 1. / self.routed_scaling_factor
-            if self.layer_idx == 0:
-                # The residual is shared by all layers, we only scale it on
-                # first layer.
-                residual *= 1. / self.routed_scaling_factor
+        hidden_states = self.self_attn(positions=positions,
+                                       hidden_states=hidden_states)
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
-
-        if isinstance(self.mlp,
-                      Ernie45MLP) and hidden_states.dtype == torch.float16:
-            # Fix FP16 overflow
-            # Scaling the Ernie45MLP output, it is the input of
-            # input_layernorm of next decoder layer.
-            # The scaling of Ernie45MOE output would be done in the forward
-            # of Ernie45MOE
-            hidden_states *= 1. / self.routed_scaling_factor
-
+        hidden_states = self.feed_forward(hidden_states)
         return hidden_states, residual
 
 
 @support_torch_compile
-class Ernie45Model(nn.Module):
+class ErnieModel(LlamaModel):
 
-    fall_back_to_pt_during_load = False
+    def __init__(self,
+                 *,
+                 vllm_config: VllmConfig,
+                 prefix: str = "",
+                 layer_type: type[ErnieDecoderLayer] = ErnieDecoderLayer):
+        self.num_experts = vllm_config.model_config.hf_config.num_local_experts
+        super().__init__(vllm_config=vllm_config,
+                         prefix=prefix,
+                         layer_type=layer_type)
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        super().__init__()
-
-        config = vllm_config.model_config.hf_config
-        model_config = vllm_config.model_config
-        cache_config = vllm_config.cache_config
-        quant_config = vllm_config.quant_config
-        self.config = config
-
-        self.vocab_size = config.vocab_size
-
-        if get_pp_group().is_first_rank:
-            self.embed_tokens = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=f"{prefix}.embed_tokens")
-        else:
-            self.embed_tokens = PPMissingLayer()
-
-        self.start_layer, self.end_layer, self.layers = make_layers(
-            config.num_hidden_layers,
-            lambda prefix: Ernie45DecoderLayer(
-                config,
-                prefix,
-                model_config=model_config,
-                cache_config=cache_config,
-                quant_config=quant_config,
-            ),
-            prefix=f"{prefix}.layers")
-
-        if get_pp_group().is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        else:
-            self.norm = PPMissingLayer()
-        self.make_empty_intermediate_tensors = (
-            make_empty_intermediate_tensors_factory(
-                ["hidden_states", "residual"], config.hidden_size))
-
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.embed_tokens(input_ids)
-
-    def forward(
+    def load_moe_expert_weights(
         self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors],
-        inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
-        if get_pp_group().is_first_rank:
-            if inputs_embeds is not None:
-                hidden_states = inputs_embeds
+        name: str,
+        loaded_weight: torch.Tensor,
+        params_dict: dict[str, nn.Parameter],
+        loaded_params: set[str],
+        expert_params_mapping: list[tuple[str, str, int, str]],
+        fused: bool = True,
+    ) -> bool:
+        expert_param_loaded = False
+        if "experts.gate_up_proj" in name:
+            loaded_weight = loaded_weight.chunk(2, dim=-1)
+        for (param_name, weight_name, expert_id,
+             shard_id) in expert_params_mapping:
+            new_loaded_weight = loaded_weight
+            if fused:
+                e_str, _, proj_str, _ = weight_name.split('.')
+                weight_name = f"{e_str}.{proj_str}"
+                param_name = f"{param_name}weight"
+            if weight_name not in name:
+                continue
+            full_param_name = name.replace(weight_name, param_name)
+            # Skip layers on other devices.
+            if is_pp_missing_parameter(name, self):
+                continue
+            if ((name.endswith(".bias") or name.endswith("_bias"))
+                    and name not in params_dict):
+                continue
+            param = params_dict[full_param_name]
+            weight_loader = param.weight_loader
+            if fused:
+                if "w13" in full_param_name:
+                    shard_idx = 0 if shard_id == "w1" else 1
+                    new_loaded_weight = new_loaded_weight[shard_idx]
+                new_loaded_weight = new_loaded_weight.transpose(-1, -2)
+                layer_idx = extract_layer_index(name)
+                # EP mapping
+                expert_map = self.layers[
+                    layer_idx].feed_forward.experts.expert_map
+                if expert_map is not None:
+                    local_expert_indices = (expert_map != -1) \
+                                            .nonzero() \
+                                            .flatten() \
+                                            .to(new_loaded_weight.device)
+                    new_loaded_weight = new_loaded_weight[local_expert_indices]
+                    expert_id = local_expert_indices[0].item()
             else:
-                hidden_states = self.get_input_embeddings(input_ids)
-            residual = None
-        else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
+                # TODO: add EP support for non fused weights
+                pass
+            weight_loader(param,
+                          new_loaded_weight,
+                          full_param_name,
+                          shard_id=shard_id,
+                          expert_id=expert_id)
 
-        for layer in self.layers[self.start_layer:self.end_layer]:
-            hidden_states, residual = layer(positions, hidden_states, residual)
-
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors({
-                "hidden_states": hidden_states,
-                "residual": residual
-            })
-
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
-
-
-class Ernie45ForCausalLM(nn.Module, SupportsPP):
-
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        super().__init__()
-        config = vllm_config.model_config.hf_config
-        quant_config = vllm_config.quant_config
-        self.config = config
-        self.quant_config = quant_config
-        self.model = Ernie45Model(vllm_config=vllm_config,
-                                     prefix=maybe_prefix(prefix, "model"))
-        if get_pp_group().is_last_rank:
-            self.lm_head = ParallelLMHead(config.vocab_size,
-                                          config.hidden_size,
-                                          quant_config=quant_config)
-        else:
-            self.lm_head = PPMissingLayer()
-        self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.make_empty_intermediate_tensors = (
-            self.model.make_empty_intermediate_tensors)
-
-    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.get_input_embeddings(input_ids)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        intermediate_tensors: Optional[IntermediateTensors] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-    ) -> Union[torch.Tensor, IntermediateTensors]:
-        hidden_states = self.model(input_ids, positions, intermediate_tensors,
-                                   inputs_embeds)
-        return hidden_states
-
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
-    ) -> Optional[torch.Tensor]:
-        logits = self.logits_processor(self.lm_head, hidden_states,
-                                       sampling_metadata)
-        return logits
-
-    def make_empty_intermediate_tensors(
-            self, batch_size: int, dtype: torch.dtype,
-            device: torch.device) -> IntermediateTensors:
-        return IntermediateTensors({
-            "hidden_states":
-            torch.zeros((batch_size, self.config.hidden_size),
-                        dtype=dtype,
-                        device=device),
-            "residual":
-            torch.zeros((batch_size, self.config.hidden_size),
-                        dtype=dtype,
-                        device=device),
-        })
+            loaded_params.add(full_param_name)
+            expert_param_loaded = True
+        return expert_param_loaded
 
     def load_weights(self, weights: Iterable[tuple[str,
                                                    torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
         ]
-
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
+        fused_experts_params = False
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts)
-
+            num_experts=self.num_experts)
+        expert_params_mapping_fused = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_up_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="gate_up_proj",
+            num_experts=1)
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
+            if "experts.gate_up_proj" in name or "experts.down_proj" in name:
+                fused_experts_params = True
+                expert_params_mapping = expert_params_mapping_fused
+            if (self.quant_config is not None and
+                (scale_name := self.quant_config.get_cache_scale(name))):
+                # Loading kv cache quantization scales
+                param = params_dict[scale_name]
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                loaded_weight = (loaded_weight if loaded_weight.dim() == 0 else
+                                 loaded_weight[0])
+                weight_loader(param, loaded_weight)
+                loaded_params.add(scale_name)
                 continue
-
-            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
-            if spec_layer is not None:
-                continue  # skip spec decode layers for main model
-
-            for (param_name, weight_name, shard_id) in stacked_params_mapping:
-                # Skip non-stacked layers and experts (experts handled below).
-                if weight_name not in name:
-                    continue
-                # We have mlp.experts[0].gate_proj in the checkpoint.
-                # Since we handle the experts below in expert_params_mapping,
-                # we need to skip here BEFORE we update the name, otherwise
-                # name will be updated to mlp.experts[0].gate_up_proj, which
-                # will then be updated below in expert_params_mapping
-                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if (("mlp.experts." in name) and name not in params_dict):
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name or "experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
                 if is_pp_missing_parameter(name, self):
                     continue
-
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(name)
                 break
             else:
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
+                moe_loaded = self.load_moe_expert_weights(
+                    name,
+                    loaded_weight,
+                    params_dict,
+                    loaded_params,
+                    expert_params_mapping,
+                    fused=fused_experts_params)
 
+                if not moe_loaded:
                     if is_pp_missing_parameter(name, self):
                         continue
-
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(param,
-                                  loaded_weight,
-                                  name,
-                                  shard_id=shard_id,
-                                  expert_id=expert_id)
-                    break
-                else:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-
-                    # Remapping the name of FP8 kv-scale.
-                    name = maybe_remap_kv_scale_name(name, params_dict)
-                    if name is None:
-                        continue
-
-                    if is_pp_missing_parameter(name, self):
-                        continue
-
                     param = params_dict[name]
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
                     weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+                    loaded_params.add(name)
         return loaded_params
 
 
-class ErnieForCausalLM(Ernie45ForCausalLM):
-    pass
+class ErnieForCausalLM(LlamaForCausalLM):
 
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
-def get_spec_layer_idx_from_weight_name(config: PretrainedConfig,
-                                        weight_name: str) -> Optional[int]:
-    if hasattr(config,
-               "num_nextn_predict_layers") and (config.num_nextn_predict_layers
-                                                > 0):
-        layer_idx = config.num_hidden_layers
-        for i in range(config.num_nextn_predict_layers):
-            if weight_name.startswith(f"model.layers.{layer_idx+i}."):
-                return layer_idx + i
-    return None
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        # update temperature tuning config from generation config
+        gen_config = vllm_config.model_config.try_get_generation_config()
+        gen_config.update(vllm_config.model_config.override_generation_config)
+        # enable temperature tuning by default when max_model_len > 32K
+        default_attn_temperature_tuning = \
+            vllm_config.model_config.max_model_len > 32768
+        vllm_config.model_config.hf_config.attn_temperature_tuning \
+            = gen_config.get(
+                "attn_temperature_tuning", default_attn_temperature_tuning)
+
+        super().__init__(vllm_config=vllm_config,
+                         prefix=prefix,
+                         layer_type=ErnieDecoderLayer)
+
+    def _init_model(self,
+                    vllm_config: VllmConfig,
+                    prefix: str = "",
+                    layer_type: type[ErnieDecoderLayer] = ErnieDecoderLayer):
+        return ErnieModel(vllm_config=vllm_config,
+                           prefix=prefix,
+                           layer_type=layer_type)
+
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=(["lm_head."]
+                           if self.config.tie_word_embeddings else None),
+        )
+        weights = [
+            self.permute_qk_weight_for_rotary(name, loaded_weight)
+            for name, loaded_weight in weights
+        ]
+        return loader.load_weights(weights)
+
+    def permute_qk_weight_for_rotary(
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+    ) -> tuple[str, torch.Tensor]:
+
+        def permute(w: torch.Tensor, n_heads: int):
+            attn_in = self.config.head_dim * n_heads
+            attn_out = self.config.hidden_size
+
+            return w.view(n_heads, attn_in // n_heads // 2, 2,
+                          attn_out).transpose(1, 2).reshape(attn_in, attn_out)
+
+        modules = name.split(".")
+
+        # rotary embeds should be sliced
+        if ("wk" in modules or "k_proj" in modules) \
+           and modules[-1] == "weight":
+            loaded_weight = permute(loaded_weight,
+                                    self.config.num_key_value_heads)
+        elif ("wq" in modules or "q_proj" in modules) \
+                and modules[-1] == "weight":
+            loaded_weight = permute(loaded_weight,
+                                    self.config.num_attention_heads)
+
+        return name, loaded_weight
