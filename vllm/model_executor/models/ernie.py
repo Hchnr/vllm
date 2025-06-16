@@ -70,11 +70,11 @@ class ErnieMLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.gate_up_proj = MergedColumnParallelLinear(
+        self.up_gate_proj = MergedColumnParallelLinear(
             hidden_size, [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj")
+            prefix=f"{prefix}.up_gate_proj")
         self.down_proj = RowParallelLinear(intermediate_size,
                                            hidden_size,
                                            bias=False,
@@ -87,7 +87,7 @@ class ErnieMLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
+        gate_up, _ = self.up_gate_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
@@ -507,14 +507,16 @@ class ErnieModel(nn.Module):
 
 class ErnieForCausalLM(nn.Module, SupportsPP):
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "ernie"):
         super().__init__()
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
-        self.model = ErnieModel(vllm_config=vllm_config,
-                                     prefix=maybe_prefix(prefix, "model"))
+        print("in ErnieForCausalLM, prefix: ", prefix)
+        print("in ErnieForCausalLM, prefix: ", maybe_prefix(prefix, "model"))
+        # self.model = ErnieModel(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
+        self.ernie = ErnieModel(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(config.vocab_size,
                                           config.hidden_size,
@@ -523,10 +525,10 @@ class ErnieForCausalLM(nn.Module, SupportsPP):
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.make_empty_intermediate_tensors = (
-            self.model.make_empty_intermediate_tensors)
+            self.ernie.make_empty_intermediate_tensors)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.get_input_embeddings(input_ids)
+        return self.ernie.get_input_embeddings(input_ids)
 
     def forward(
         self,
@@ -535,7 +537,7 @@ class ErnieForCausalLM(nn.Module, SupportsPP):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        hidden_states = self.model(input_ids, positions, intermediate_tensors,
+        hidden_states = self.ernie(input_ids, positions, intermediate_tensors,
                                    inputs_embeds)
         return hidden_states
 
@@ -600,7 +602,7 @@ class ErnieForCausalLM(nn.Module, SupportsPP):
                 # for mlp.experts[0].gate_gate_up_proj, which breaks load.
                 if (("mlp.experts." in name) and name not in params_dict):
                     continue
-                name = name.replace(weight_name, param_name)
+                # name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -608,6 +610,7 @@ class ErnieForCausalLM(nn.Module, SupportsPP):
                 if is_pp_missing_parameter(name, self):
                     continue
 
+                print("in load_weights, params_dict1: ", params_dict.keys())
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -643,6 +646,8 @@ class ErnieForCausalLM(nn.Module, SupportsPP):
                     if is_pp_missing_parameter(name, self):
                         continue
 
+                    print("in load_weights, params_dict2: ", params_dict.keys())
+                    # name_replaced = name.replace("ernie.", "model.")
                     param = params_dict[name]
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
