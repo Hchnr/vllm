@@ -22,7 +22,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inference-only DeepseekV2/DeepseekV3 model."""
+"""Inference-only Ernie45-Turbo model."""
 from collections.abc import Iterable
 from typing import Any, Optional, Union
 
@@ -57,7 +57,7 @@ from .utils import (PPMissingLayer, is_pp_missing_parameter,
                     maybe_prefix)
 
 
-class DeepseekV2MLP(nn.Module):
+class Ernie45MLP(nn.Module):
 
     def __init__(
         self,
@@ -92,7 +92,7 @@ class DeepseekV2MLP(nn.Module):
         return x
 
 
-class DeepseekV2MoE(nn.Module):
+class Ernie45MoE(nn.Module):
 
     def __init__(
         self,
@@ -138,7 +138,7 @@ class DeepseekV2MoE(nn.Module):
         if config.n_shared_experts is not None:
             intermediate_size = (config.moe_intermediate_size *
                                  config.n_shared_experts)
-            self.shared_experts = DeepseekV2MLP(
+            self.shared_experts = Ernie45MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
@@ -162,7 +162,7 @@ class DeepseekV2MoE(nn.Module):
                 router_logits=router_logits) * self.routed_scaling_factor
         else:
             # Fix FP16 overflow
-            # See DeepseekV2DecoderLayer for more details.
+            # See Ernie45DecoderLayer for more details.
             final_hidden_states = self.experts(hidden_states=hidden_states,
                                                router_logits=router_logits)
         if shared_output is not None:
@@ -170,7 +170,7 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states = final_hidden_states + shared_output
             else:
                 # Fix FP16 overflow
-                # See DeepseekV2DecoderLayer for more details.
+                # See Ernie45DecoderLayer for more details.
                 final_hidden_states = final_hidden_states + shared_output \
                     * (1. / self.routed_scaling_factor)
 
@@ -189,7 +189,7 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
-class DeepseekV2Attention(nn.Module):
+class Ernie45Attention(nn.Module):
 
     def __init__(
         self,
@@ -335,9 +335,9 @@ class DeepseekV2Attention(nn.Module):
         return output
 
 
-class DeepseekV2MLAAttention(nn.Module):
+class Ernie45MLAAttention(nn.Module):
     """
-    Main reference: DeepseekV2 paper, and FlashInfer Implementation
+    Main reference: Ernie45 paper, and FlashInfer Implementation
     (https://arxiv.org/abs/2405.04434 and https://github.com/flashinfer-ai/flashinfer/pull/551).
     
     For more info see MLACommonImpl in: vllm/attention/backends/mla/utils.py
@@ -494,7 +494,7 @@ class DeepseekV2MLAAttention(nn.Module):
         return self.o_proj(attn_out)[0]
 
 
-class DeepseekV2DecoderLayer(nn.Module):
+class Ernie45DecoderLayer(nn.Module):
 
     def __init__(
         self,
@@ -515,9 +515,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         layer_idx = int(prefix.split(sep='.')[-1])
         self.layer_idx = layer_idx
         if model_config.use_mla:
-            attn_cls = DeepseekV2MLAAttention
+            attn_cls = Ernie45MLAAttention
         else:
-            attn_cls = DeepseekV2Attention
+            attn_cls = Ernie45Attention
         self.self_attn = attn_cls(
             config=config,
             hidden_size=self.hidden_size,
@@ -539,13 +539,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         if (config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
                 and layer_idx % config.moe_layer_freq == 0):
-            self.mlp = DeepseekV2MoE(
+            self.mlp = Ernie45MoE(
                 config=config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
         else:
-            self.mlp = DeepseekV2MLP(
+            self.mlp = Ernie45MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
@@ -592,19 +592,19 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
 
         if isinstance(self.mlp,
-                      DeepseekV2MLP) and hidden_states.dtype == torch.float16:
+                      Ernie45MLP) and hidden_states.dtype == torch.float16:
             # Fix FP16 overflow
-            # Scaling the DeepseekV2MLP output, it is the input of
+            # Scaling the Ernie45MLP output, it is the input of
             # input_layernorm of next decoder layer.
-            # The scaling of DeepseekV2MOE output would be done in the forward
-            # of DeepseekV2MOE
+            # The scaling of Ernie45MOE output would be done in the forward
+            # of Ernie45MOE
             hidden_states *= 1. / self.routed_scaling_factor
 
         return hidden_states, residual
 
 
 @support_torch_compile
-class DeepseekV2Model(nn.Module):
+class Ernie45Model(nn.Module):
 
     fall_back_to_pt_during_load = False
 
@@ -630,7 +630,7 @@ class DeepseekV2Model(nn.Module):
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: DeepseekV2DecoderLayer(
+            lambda prefix: Ernie45DecoderLayer(
                 config,
                 prefix,
                 model_config=model_config,
@@ -681,7 +681,7 @@ class DeepseekV2Model(nn.Module):
         return hidden_states
 
 
-class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
+class Ernie45ForCausalLM(nn.Module, SupportsPP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -689,7 +689,7 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
-        self.model = DeepseekV2Model(vllm_config=vllm_config,
+        self.model = Ernie45Model(vllm_config=vllm_config,
                                      prefix=maybe_prefix(prefix, "model"))
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(config.vocab_size,
@@ -827,7 +827,7 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
         return loaded_params
 
 
-class ErnieForCausalLM(DeepseekV2ForCausalLM):
+class ErnieForCausalLM(Ernie45ForCausalLM):
     pass
 
 
