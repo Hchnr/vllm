@@ -136,24 +136,9 @@ class ErnieMoE(nn.Module):
             scoring_func=config.scoring_func,
             e_score_correction_bias=self.gate.e_score_correction_bias)
 
-        if config.n_shared_experts is not None:
-            intermediate_size = (config.moe_intermediate_size *
-                                 config.n_shared_experts)
-            self.shared_experts = ErnieMLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=intermediate_size,
-                hidden_act=config.hidden_act,
-                quant_config=quant_config,
-                reduce_results=self.experts.must_reduce_shared_expert_outputs(
-                ),
-                prefix=f"{prefix}.shared_experts",
-            )
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        if self.n_shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
 
@@ -166,14 +151,6 @@ class ErnieMoE(nn.Module):
             # See ErnieDecoderLayer for more details.
             final_hidden_states = self.experts(hidden_states=hidden_states,
                                                router_logits=router_logits)
-        if shared_output is not None:
-            if hidden_states.dtype != torch.float16:
-                final_hidden_states = final_hidden_states + shared_output
-            else:
-                # Fix FP16 overflow
-                # See ErnieDecoderLayer for more details.
-                final_hidden_states = final_hidden_states + shared_output \
-                    * (1. / self.routed_scaling_factor)
 
         if self.tp_size > 1:
             final_hidden_states = (
@@ -207,7 +184,6 @@ class ErnieAttention(nn.Module):
                  prefix: str = "") -> None:
         super().__init__()
         self.layer_idx = extract_layer_index(prefix)
-        print("in ernie self.layer_idx: ", self.layer_idx)
         self.hidden_size = hidden_size
         self.use_qk_norm = False
         tp_size = get_tensor_model_parallel_world_size()
@@ -513,8 +489,6 @@ class ErnieForCausalLM(nn.Module, SupportsPP):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
-        print("in ErnieForCausalLM, prefix: ", prefix)
-        print("in ErnieForCausalLM, prefix: ", maybe_prefix(prefix, "model"))
         # self.model = ErnieModel(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
         self.ernie = ErnieModel(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
         if get_pp_group().is_last_rank:
@@ -579,6 +553,7 @@ class ErnieForCausalLM(nn.Module, SupportsPP):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts)
+        print("expert_params_mapping: ", expert_params_mapping)
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
@@ -610,7 +585,6 @@ class ErnieForCausalLM(nn.Module, SupportsPP):
                 if is_pp_missing_parameter(name, self):
                     continue
 
-                print("in load_weights, params_dict1: ", params_dict.keys())
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -646,11 +620,10 @@ class ErnieForCausalLM(nn.Module, SupportsPP):
                     if is_pp_missing_parameter(name, self):
                         continue
 
-                    print("in load_weights, params_dict2: ", params_dict.keys())
-                    # name_replaced = name.replace("ernie.", "model.")
                     param = params_dict[name]
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
+                    print("loading weight for: ", name)
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
