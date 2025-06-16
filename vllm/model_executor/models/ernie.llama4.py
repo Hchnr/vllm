@@ -22,7 +22,7 @@ from typing import Any, Optional
 
 import torch
 from torch import nn
-from transformers import ErnieTextConfig
+from transformers import PretrainedConfig
 
 from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
@@ -57,7 +57,7 @@ class ErnieMoE(nn.Module):
         return (router_scores, router_indices.to(torch.int32))
 
     def __init__(self,
-                 config: ErnieTextConfig,
+                 config: PretrainedConfig,
                  quant_config: Optional[QuantizationConfig] = None,
                  prefix: str = ""):
         super().__init__()
@@ -66,13 +66,13 @@ class ErnieMoE(nn.Module):
 
         intermediate_size_moe = config.intermediate_size
         self.router = ReplicatedLinear(config.hidden_size,
-                                       config.num_local_experts,
+                                       config.moe_num_experts,
                                        bias=False,
                                        quant_config=None,
                                        prefix=f"{prefix}.router")
 
         self.experts = FusedMoE(
-            num_experts=config.num_local_experts,
+            num_experts=config.moe_num_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             custom_routing_function=ErnieMoE.custom_routing_function,
@@ -112,7 +112,7 @@ class ErnieMoE(nn.Module):
 class ErnieAttention(nn.Module):
 
     def __init__(self,
-                 config: ErnieTextConfig,
+                 config: PretrainedConfig,
                  hidden_size: int,
                  num_heads: int,
                  num_kv_heads: int,
@@ -126,10 +126,9 @@ class ErnieAttention(nn.Module):
                  prefix: str = "") -> None:
         super().__init__()
         self.layer_idx = extract_layer_index(prefix)
+        print("in ernie self.layer_idx: ", self.layer_idx)
         self.hidden_size = hidden_size
-        self.no_rope_layers = config.no_rope_layers
-        self.nope = self.no_rope_layers[self.layer_idx] == 0
-        self.use_qk_norm = config.use_qk_norm and not self.nope
+        self.use_qk_norm = False
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
@@ -149,8 +148,7 @@ class ErnieAttention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
         # TODO: attn_temperature_tuning should be a bool in huggingface
-        self.attn_temperature_tuning = self.nope and \
-            config.attn_temperature_tuning > 0
+        self.attn_temperature_tuning = False
 
         self.floor_scale = getattr(config, "floor_scale", 8192.0)
         self.attn_scale = getattr(config, "attn_scale", 0.1)
@@ -192,7 +190,7 @@ class ErnieAttention(nn.Module):
             base=int(rope_theta),
             rope_scaling=rope_scaling if rope_scaling != "default" else None,
             is_neox_style=is_neox_style,
-        ) if not self.nope else None
+        )
 
         self.attn = Attention(
             self.num_heads,
@@ -202,7 +200,7 @@ class ErnieAttention(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             per_layer_sliding_window=None,
-            use_irope=not self.nope,
+            use_irope=False,
             prefix=f"{prefix}.attn",
         )
 
@@ -248,7 +246,7 @@ class ErnieDecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: ErnieTextConfig,
+        config: PretrainedConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -328,7 +326,7 @@ class ErnieModel(LlamaModel):
                  vllm_config: VllmConfig,
                  prefix: str = "",
                  layer_type: type[ErnieDecoderLayer] = ErnieDecoderLayer):
-        self.num_experts = vllm_config.model_config.hf_config.num_local_experts
+        self.num_experts = vllm_config.model_config.hf_config.moe_num_experts
         super().__init__(vllm_config=vllm_config,
                          prefix=prefix,
                          layer_type=layer_type)
