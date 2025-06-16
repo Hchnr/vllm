@@ -66,13 +66,13 @@ class ErnieMoE(nn.Module):
 
         intermediate_size_moe = config.intermediate_size
         self.router = ReplicatedLinear(config.hidden_size,
-                                       config.num_local_experts,
+                                       config.moe_num_experts,
                                        bias=False,
                                        quant_config=None,
                                        prefix=f"{prefix}.router")
 
         self.experts = FusedMoE(
-            num_experts=config.num_local_experts,
+            num_experts=config.moe_num_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             custom_routing_function=ErnieMoE.custom_routing_function,
@@ -328,7 +328,7 @@ class ErnieModel(LlamaModel):
                  vllm_config: VllmConfig,
                  prefix: str = "",
                  layer_type: type[ErnieDecoderLayer] = ErnieDecoderLayer):
-        self.num_experts = vllm_config.model_config.hf_config.num_local_experts
+        self.num_experts = vllm_config.model_config.hf_config.moe_num_experts
         super().__init__(vllm_config=vllm_config,
                          prefix=prefix,
                          layer_type=layer_type)
