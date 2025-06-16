@@ -24,7 +24,7 @@
 # limitations under the License.
 """Inference-only Ernie45-Turbo model."""
 from collections.abc import Iterable
-from typing import Any, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 import torch
 from torch import nn
@@ -38,6 +38,7 @@ from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
+                                               QKVParallelLinear,
                                                MergedColumnParallelLinear,
                                                ReplicatedLinear,
                                                RowParallelLinear)
@@ -54,7 +55,7 @@ from vllm.sequence import IntermediateTensors
 from .interfaces import SupportsPP
 from .utils import (PPMissingLayer, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
-                    maybe_prefix)
+                    maybe_prefix, extract_layer_index)
 
 
 class ErnieMLP(nn.Module):
@@ -191,146 +192,133 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
 
 class ErnieAttention(nn.Module):
 
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        hidden_size: int,
-        num_heads: int,
-        qk_nope_head_dim: int,
-        qk_rope_head_dim: int,
-        v_head_dim: int,
-        q_lora_rank: int,
-        kv_lora_rank: int,
-        rope_theta: float = 10000,
-        rope_scaling: Optional[dict[str, Any]] = None,
-        max_position_embeddings: int = 8192,
-        cache_config: Optional[CacheConfig] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
+    def __init__(self,
+                 config: PretrainedConfig,
+                 hidden_size: int,
+                 num_heads: int,
+                 num_kv_heads: int,
+                 rope_theta: float = 10000,
+                 rope_scaling: Optional[dict[str, Any]] = None,
+                 max_position_embeddings: int = 8192,
+                 quant_config: Optional[QuantizationConfig] = None,
+                 bias: bool = False,
+                 bias_o_proj: bool = False,
+                 cache_config: Optional[CacheConfig] = None,
+                 prefix: str = "") -> None:
         super().__init__()
+        self.layer_idx = extract_layer_index(prefix)
+        print("in ernie self.layer_idx: ", self.layer_idx)
         self.hidden_size = hidden_size
-        self.qk_nope_head_dim = qk_nope_head_dim
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
-        self.v_head_dim = v_head_dim
-        self.q_lora_rank = q_lora_rank
-        self.kv_lora_rank = kv_lora_rank
-        self.num_heads = num_heads
+        self.use_qk_norm = False
         tp_size = get_tensor_model_parallel_world_size()
-        assert num_heads % tp_size == 0
-        self.num_local_heads = num_heads // tp_size
-        self.scaling = self.qk_head_dim**-0.5
+        self.total_num_heads = num_heads
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
+        self.total_num_kv_heads = num_kv_heads
+        if self.total_num_kv_heads >= tp_size:
+            # Number of KV heads is greater than TP size, so we partition
+            # the KV heads across multiple tensor parallel GPUs.
+            assert self.total_num_kv_heads % tp_size == 0
+        else:
+            # Number of KV heads is less than TP size, so we replicate
+            # the KV heads across multiple tensor parallel GPUs.
+            assert tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.head_dim = config.head_dim
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = self.head_dim**-0.5
+        # TODO: attn_temperature_tuning should be a bool in huggingface
+        self.attn_temperature_tuning = False
+
+        self.floor_scale = getattr(config, "floor_scale", 8192.0)
+        self.attn_scale = getattr(config, "attn_scale", 0.1)
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
-
-        if self.q_lora_rank is not None:
-            self.q_a_proj = ReplicatedLinear(self.hidden_size,
-                                             self.q_lora_rank,
-                                             bias=False,
-                                             quant_config=quant_config,
-                                             prefix=f"{prefix}.q_a_proj")
-            self.q_a_layernorm = RMSNorm(self.q_lora_rank,
-                                         eps=config.rms_norm_eps)
-            self.q_b_proj = ColumnParallelLinear(q_lora_rank,
-                                                 self.num_heads *
-                                                 self.qk_head_dim,
-                                                 bias=False,
-                                                 quant_config=quant_config,
-                                                 prefix=f"{prefix}.q_b_proj")
-        else:
-            self.q_proj = ColumnParallelLinear(self.hidden_size,
-                                               self.num_heads *
-                                               self.qk_head_dim,
-                                               bias=False,
-                                               quant_config=quant_config,
-                                               prefix=f"{prefix}.q_proj")
-
-        self.kv_a_proj_with_mqa = ReplicatedLinear(
-            self.hidden_size,
-            self.kv_lora_rank + self.qk_rope_head_dim,
-            bias=False,
+        self.n_rep = self.num_heads // self.num_kv_heads
+        self.qk_norm = RMSNorm(
+            hidden_size=self.head_dim,
+            eps=config.rms_norm_eps,
+            has_weight=False,
+            dtype=torch.float32,
+        ) if self.use_qk_norm else None
+        self.qkv_proj = QKVParallelLinear(
+            hidden_size=hidden_size,
+            head_size=self.head_dim,
+            total_num_heads=self.total_num_heads,
+            total_num_kv_heads=self.total_num_kv_heads,
+            bias=bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.kv_a_proj_with_mqa")
-        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank,
-                                      eps=config.rms_norm_eps)
-        self.kv_b_proj = ColumnParallelLinear(
-            self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=False,
+            prefix=f"{prefix}.qkv_proj",
+        )
+
+        self.o_proj = RowParallelLinear(
+            input_size=self.total_num_heads * self.head_dim,
+            output_size=hidden_size,
+            bias=bias_o_proj,
             quant_config=quant_config,
-            prefix=f"{prefix}.kv_b_proj")
-        # O projection.
-        self.o_proj = RowParallelLinear(self.num_heads * self.v_head_dim,
-                                        self.hidden_size,
-                                        bias=False,
-                                        quant_config=quant_config,
-                                        prefix=f"{prefix}.o_proj")
-        if rope_scaling:
-            rope_scaling["rope_type"] = 'deepseek_yarn'
+            prefix=f"{prefix}.o_proj",
+        )
+        is_neox_style = True
+        is_gguf = quant_config and quant_config.get_name() == "gguf"
+        if is_gguf and config.model_type == "llama":
+            is_neox_style = False
 
-        self.rotary_emb = get_rope(qk_rope_head_dim,
-                                   rotary_dim=qk_rope_head_dim,
-                                   max_position=max_position_embeddings,
-                                   base=rope_theta,
-                                   rope_scaling=rope_scaling,
-                                   is_neox_style=False)
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=max_position_embeddings,
+            base=int(rope_theta),
+            rope_scaling=rope_scaling if rope_scaling != "default" else None,
+            is_neox_style=is_neox_style,
+        )
 
-        if rope_scaling:
-            mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
-            scaling_factor = rope_scaling["factor"]
-            mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
-            self.scaling = self.scaling * mscale * mscale
+        self.attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            per_layer_sliding_window=None,
+            use_irope=False,
+            prefix=f"{prefix}.attn",
+        )
 
-        self.attn = Attention(self.num_local_heads,
-                              self.qk_head_dim,
-                              self.scaling,
-                              num_kv_heads=self.num_local_heads,
-                              cache_config=cache_config,
-                              quant_config=quant_config,
-                              prefix=f"{prefix}.attn")
+    def _get_attn_scale(self, positions: torch.Tensor) -> torch.Tensor:
+        floor = torch.floor((positions + 1.0) / self.floor_scale)
+        attn_scale = torch.log(floor + 1.0) * self.attn_scale + 1.0
+
+        return attn_scale.unsqueeze(-1)
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        if self.q_lora_rank is not None:
-            q = self.q_a_proj(hidden_states)[0]
-            q = self.q_a_layernorm(q)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads,
-                                         self.qk_head_dim)
-        else:
-            q = self.q_proj(hidden_states)[0].view(-1, self.num_local_heads,
-                                                   self.qk_head_dim)
-        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim],
-                               dim=-1)
-        latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
-        kv_a, _ = latent_cache.split(
-            [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        latent_cache = latent_cache.unsqueeze(1)
-        kv_a = self.kv_a_layernorm(kv_a.contiguous())
-        kv = self.kv_b_proj(kv_a)[0]
-        kv = kv.view(-1, self.num_local_heads,
-                     self.qk_nope_head_dim + self.v_head_dim)
-        k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        k_pe = latent_cache[:, :, self.kv_lora_rank:]
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        if self.rotary_emb is not None:
+            q, k = self.rotary_emb(positions, q, k)
+        if self.qk_norm is not None:
+            q = q.reshape(-1, self.num_heads, self.head_dim)
+            q = self.qk_norm(q.float()).reshape(-1, self.q_size).to(q.dtype)
+            k = k.reshape(-1, self.num_kv_heads, self.head_dim)
+            k = self.qk_norm(k.float()).reshape(-1, self.kv_size).to(k.dtype)
 
-        q[..., self.qk_nope_head_dim:] = q_pe
-        k = torch.empty_like(q)
-        k[..., :self.qk_nope_head_dim] = k_nope
-        k[..., self.qk_nope_head_dim:] = k_pe
-        # padding value to qk_head_dim for alignment
-        v = torch.nn.functional.pad(
-            v, [0, self.qk_head_dim - self.v_head_dim],
-            value=0).view(-1, self.num_local_heads * self.qk_head_dim)
+        # We are applying temperature tuning (https://arxiv.org/abs/2501.19399)
+        # to NoPE layers, where the inference-time temperature tuning function
+        # is customized to not affect short context
+        # while working at very long context
+        # https://arxiv.org/abs/2501.19399
+        #
+        # We should apply temperature tuning between (after) rotary / QK norm
+        # and (before) attention.
+        if self.attn_temperature_tuning and self.nope:
+            attn_scale = self._get_attn_scale(positions)
+            q = (q * attn_scale).to(q.dtype)
         attn_output = self.attn(q, k, v)
-        attn_output = attn_output.view(
-            -1, self.num_local_heads,
-            self.qk_head_dim)[..., :self.v_head_dim].reshape(
-                -1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -361,18 +349,15 @@ class ErnieDecoderLayer(nn.Module):
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
-            qk_nope_head_dim=config.qk_nope_head_dim,
-            qk_rope_head_dim=config.qk_rope_head_dim,
-            v_head_dim=config.v_head_dim,
-            q_lora_rank=config.q_lora_rank
-            if hasattr(config, "q_lora_rank") else None,
-            kv_lora_rank=config.kv_lora_rank,
+            num_kv_heads=config.num_kv_heads,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
+            bias=False,
+            bias_o_proj=False,
         )
 
         if (config.n_routed_experts is not None
