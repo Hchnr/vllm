@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
+import time
 from vllm import LLM, SamplingParams
 
 # Sample prompts.
@@ -34,4 +34,6 @@ def main():
 
 
 if __name__ == "__main__":
+    t_start = time.time()
     main()
+    print(f"time cost: {time.time() - t_start}")
