@@ -11,13 +11,14 @@ prompts = [
     "The future of AI is",
 ]
 # Create a sampling params object.
-sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
+sampling_params = SamplingParams()
 
-MODEL_PATH = "/share/project/lms/ernie/ernie_tmp/ernie34T-4l_torch"
+MODEL_PATH = "/share/project/hcr/models/wenxinyiyan/ernie34T-4l_torch_split"
+MODEL_PATH = "/share/project/hcr/models/wenxinyiyan/ernie45T-trans"
 
 def main():
     # Create an LLM.
-    llm = LLM(model=MODEL_PATH, trust_remote_code=True)
+    llm = LLM(model=MODEL_PATH, trust_remote_code=True, tensor_parallel_size=8, gpu_memory_utilization=0.96, max_model_len=40960)
     # Generate texts from the prompts.
     # The output is a list of RequestOutput objects
     # that contain the prompt, generated text, and other information.
