@@ -75,6 +75,7 @@ class ErnieMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.up_gate_proj")
+        # print(f"in ErnieMLP quant_config {prefix}: {quant_config}")
         self.down_proj = RowParallelLinear(intermediate_size,
                                            hidden_size,
                                            bias=False,
@@ -86,10 +87,24 @@ class ErnieMLP(nn.Module):
                              "Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
+    def forward(self, x, layer_idx=None):
+        # print(f"in ErnieMLP input: {x.shape} {x}")
         gate_up, _ = self.up_gate_proj(x)
+
+        '''
+        
+        if gate_up.shape[0] == 13 and layer_idx == 0:
+            torch.save(gate_up, f"up_out_layer_0.pt")
+            print("save up_out.")
+            print(f"in ErnieMLP up_gate_weights: {self.up_gate_proj.weight.shape} {self.up_gate_proj.weight}")
+            print(f"in ErnieMLP up_gate_weights: {self.up_gate_proj.state_dict()}")
+        '''
+
+        # print(f"in ErnieMLP up_gate_out: {gate_up.shape} {gate_up}")
         x = self.act_fn(gate_up)
+        # print(f"in ErnieMLP act_out: {x.shape} {x}")
         x, _ = self.down_proj(x)
+        # print(f"in ErnieMLP down_out: {x.shape} {x}")
         return x
 
 
@@ -136,7 +151,7 @@ class ErnieMoE(nn.Module):
             scoring_func=config.scoring_func,
             e_score_correction_bias=self.gate.e_score_correction_bias)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, layer_idx=None) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (num_tokens, n_experts)
@@ -364,6 +379,9 @@ class ErnieDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        # print(f"layer-{self.layer_idx} input: {hidden_states.shape})")
+        # print(f"layer-{self.layer_idx} input: {hidden_states.shape} {hidden_states})")
+
         # Self Attention
         if residual is None:
             residual = hidden_states
@@ -371,10 +389,15 @@ class ErnieDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
+            
+        # print(f"layer-{self.layer_idx} input_norm: {hidden_states.shape} {hidden_states})")
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
+
+        # print(f"layer-{self.layer_idx} self_attn: {hidden_states.shape} {hidden_states})")
 
         if hidden_states.dtype == torch.float16:
             # Fix FP16 overflow
@@ -389,7 +412,10 @@ class ErnieDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        
+        # print(f"layer-{self.layer_idx} post_norm: {hidden_states.shape} {hidden_states})")
+
+        hidden_states = self.mlp(hidden_states, layer_idx=self.layer_idx)
 
         if isinstance(self.mlp,
                       ErnieMLP) and hidden_states.dtype == torch.float16:
@@ -399,6 +425,8 @@ class ErnieDecoderLayer(nn.Module):
             # The scaling of ErnieMOE output would be done in the forward
             # of ErnieMOE
             hidden_states *= 1. / self.routed_scaling_factor
+
+        # print(f"layer-{self.layer_idx} mlp: {hidden_states.shape} {hidden_states})")
 
         return hidden_states, residual
 
@@ -468,8 +496,14 @@ class ErnieModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        layer_idx = 0
         for layer in self.layers[self.start_layer:self.end_layer]:
+            # print(f"layer-{layer_idx} input hidden_states: {hidden_states.shape} {hidden_states}")
+            
             hidden_states, residual = layer(positions, hidden_states, residual)
+
+            # print(f"layer-{layer_idx} output hidden_states: {hidden_states.shape} {hidden_states}")
+            layer_idx += 1
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
@@ -484,6 +518,9 @@ class ErnieModel(nn.Module):
 class ErnieForCausalLM(nn.Module, SupportsPP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "ernie"):
+        print(f"in ErnieForCausalLM.init() vllm_config: {vllm_config}")
+        print(f"in ErnieForCausalLM.init() vllm_config.model_config: {vllm_config.model_config}")
+
         super().__init__()
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
@@ -545,6 +582,7 @@ class ErnieForCausalLM(nn.Module, SupportsPP):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
+        stacked_params_mapping = []
 
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
@@ -585,6 +623,8 @@ class ErnieForCausalLM(nn.Module, SupportsPP):
                 if is_pp_missing_parameter(name, self):
                     continue
 
+                if name == "ernie.layers.0.mlp.up_gate_proj.weight":
+                    print("load1: stack load.")
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -599,6 +639,8 @@ class ErnieForCausalLM(nn.Module, SupportsPP):
                     if is_pp_missing_parameter(name, self):
                         continue
 
+                    if name == "ernie.layers.0.mlp.up_gate_proj.weight":
+                        print("load2: none stack moe load.")
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(param,
@@ -620,6 +662,8 @@ class ErnieForCausalLM(nn.Module, SupportsPP):
                     if is_pp_missing_parameter(name, self):
                         continue
 
+                    if name == "ernie.layers.0.mlp.up_gate_proj.weight":
+                        print("load3: none stack none moe load.")
                     param = params_dict[name]
                     weight_loader = getattr(param, "weight_loader",
                                             default_weight_loader)
