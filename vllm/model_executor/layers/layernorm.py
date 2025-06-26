@@ -30,6 +30,23 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor,
     return out
 
 
+# rms_norm 较难和Paddle对齐，先使用Paddle的实现
+def rms_norm2(x: torch.Tensor, weight: torch.Tensor,
+             variance_epsilon: float) -> torch.Tensor:
+    import paddle
+    from paddle.incubate.nn.functional import fused_rms_norm as fused_rms_norm_paddle
+    x_pd = paddle.to_tensor(x.view(torch.int16).cpu().numpy(), dtype='int16').view(paddle.bfloat16).cuda()
+    weight_pd = paddle.to_tensor(weight.view(torch.int16).cpu().numpy(), dtype='int16').view(paddle.bfloat16).cuda()
+
+    out_paddle = fused_rms_norm_paddle(
+        x_pd, norm_weight=weight_pd, norm_bias=None, epsilon=variance_epsilon, begin_norm_axis=1, bias=None, 
+        residual=None, quant_scale=-1, quant_round_type=0, quant_max_bound=0, quant_min_bound=0,
+    )[0]
+    out = torch.tensor(out_paddle.view(paddle.int16).cpu().numpy(), dtype=torch.int16).view(torch.bfloat16).cuda()
+
+    return out
+
+
 def fused_add_rms_norm(
         x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
         variance_epsilon: float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -40,6 +57,26 @@ def fused_add_rms_norm(
         weight,
         variance_epsilon,
     )
+    return x, residual
+
+
+# 较难和Paddle对齐，先使用Paddle的实现
+def fused_add_rms_norm2(
+        x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
+        variance_epsilon: float) -> tuple[torch.Tensor, torch.Tensor]:
+    import paddle
+    from paddle.incubate.nn.functional import fused_rms_norm as fused_rms_norm_paddle
+    x_pd = paddle.to_tensor(x.view(torch.int16).cpu().numpy(), dtype='int16').view(paddle.bfloat16).cuda()
+    weight_pd = paddle.to_tensor(weight.view(torch.int16).cpu().numpy(), dtype='int16').view(paddle.bfloat16).cuda()
+    residual_pd = paddle.to_tensor(residual.view(torch.int16).cpu().numpy(), dtype='int16').view(paddle.bfloat16).cuda()
+
+    out_paddle = fused_rms_norm_paddle(
+        x_pd, norm_weight=weight_pd, norm_bias=None, epsilon=variance_epsilon, begin_norm_axis=1, bias=None, 
+        residual=residual_pd, quant_scale=-1, quant_round_type=0, quant_max_bound=0, quant_min_bound=0,
+    )
+    x = torch.tensor(out_paddle[0].view(paddle.int16).cpu().numpy(), dtype=torch.int16).view(torch.bfloat16).cuda()
+    residual = torch.tensor(out_paddle[1].view(paddle.int16).cpu().numpy(), dtype=torch.int16).view(torch.bfloat16).cuda()
+
     return x, residual
 
 

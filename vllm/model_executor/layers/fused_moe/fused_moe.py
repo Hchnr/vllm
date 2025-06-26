@@ -847,12 +847,8 @@ def vllm_topk_softmax(topk_weights: torch.Tensor, topk_indices: torch.Tensor,
                       token_expert_indices: torch.Tensor,
                       gating_output: torch.Tensor,
                       renormalize: bool) -> tuple[torch.Tensor, ...]:
-    ops.topk_softmax(
-        topk_weights,
-        topk_indices,
-        token_expert_indices,
-        gating_output,
-    )
+    ops.topk_softmax(topk_weights, topk_indices, token_expert_indices, gating_output,)
+    # re-implement topk_softmax to add bias before softmax 
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
@@ -865,13 +861,13 @@ def dispatch_topk_func() -> Callable[..., tuple[torch.Tensor, ...]]:
         return rocm_aiter_topk_softmax
     return vllm_topk_softmax
 
-
 def fused_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
     indices_type: Optional[torch.dtype] = None,
+    e_score_correction_bias: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert hidden_states.shape[0] == gating_output.shape[0], (
         "Number of tokens mismatch")
@@ -898,6 +894,18 @@ def fused_topk(
     topk_weights, topk_ids = topk_func(topk_weights, topk_ids,
                                        token_expert_indices,
                                        gating_output_float, renormalize)
+
+    # 1. Original Implement: ops.topk_softmax(topk_weights, topk_indices, token_expert_indices, gating_output,)
+    # 2. Re-implement:  add e_score_correction_bias before softmax 
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+    # print(f"in fused_topk, gating_output_float:{gating_output_float.shape} {gating_output_float}")
+    # print(f"in fused_topk, e_score_correction_bias:{e_score_correction_bias.shape} {e_score_correction_bias}")
+    # print(f"in fused_topk, topk_weights: {topk_weights.shape} {topk_weights}")
+    # print(f"in fused_topk, topk_ids: {topk_ids.shape} {topk_ids}")
+    # print(f"in fused_topk, token_expert_indices: {token_expert_indices.shape} {token_expert_indices}")
+    # print(f"in fused_topk, renormalize: {renormalize}")
 
     return topk_weights, topk_ids, token_expert_indices
 

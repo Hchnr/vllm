@@ -599,6 +599,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
     ) -> torch.Tensor:
+        from vllm.config import is_debug_start, tmp_tensors, new_tmp_tensors
+        if x.shape[0] == 13:
+            is_debug_start = False
+
+        key = "moe"
 
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
@@ -612,6 +617,13 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias,
             indices_type=self.topk_indices_dtype)
+
+        # print(f"in UnquantizedFusedMoEMethod: {is_debug_start}, {new_tmp_tensors.keys()}")
+        if is_debug_start:
+            new_tmp_tensors[f"{key}.topk_weights"] = topk_weights.clone()
+            topk_weights = tmp_tensors[f"{key}.topk_weights"]
+            new_tmp_tensors[f"{key}.topk_idx"] = topk_ids.clone()
+            topk_ids = tmp_tensors[f"{key}.topk_idx"]
 
         if self.rocm_aiter_moe_enabled:
             assert expert_map is None
@@ -890,7 +902,7 @@ class FusedMoE(torch.nn.Module):
 
         if self.scoring_func != "softmax" and not self.use_grouped_topk:
             raise ValueError("Only softmax scoring function is supported for "
-                             "non-grouped topk.")
+                             f"non-grouped topk. {self.scoring_func}")
         if current_platform.is_hpu():
             from vllm_hpu_extension.ops import DynamicFusedMOE
             self.hpu_fused_moe = DynamicFusedMOE(self.global_num_experts)
@@ -1290,6 +1302,9 @@ class FusedMoE(torch.nn.Module):
         from vllm.model_executor.layers.fused_moe.fused_moe import fused_topk
 
         # DeekSeekv2 uses grouped_top_k
+        # print(f"in FusedMoE, use_grouped_topk:{use_grouped_topk}, custom_routing_function:{custom_routing_function}")
+
+        '''
         if use_grouped_topk:
             assert topk_group is not None
             assert num_expert_group is not None
@@ -1311,7 +1326,10 @@ class FusedMoE(torch.nn.Module):
                 topk=top_k,
                 renormalize=renormalize,
                 indices_type=indices_type,
+                e_score_correction_bias=e_score_correction_bias,
             )
+            print(f"in FusedMoE, origin-implement topk_weights: {topk_weights.shape} {topk_weights.dtype} {topk_weights}")
+            print(f"in FusedMoE, origin-implement topk_ids: {topk_ids.shape} {topk_ids.dtype} {topk_ids}")
         else:
             topk_weights, topk_ids = custom_routing_function(
                 hidden_states=hidden_states,
@@ -1320,6 +1338,22 @@ class FusedMoE(torch.nn.Module):
                 renormalize=renormalize)
             if indices_type is not None:
                 topk_ids = topk_ids.to(dtype=indices_type)
+        '''
+
+        # 1. Original Implement: ops.topk_softmax(topk_weights, topk_indices, token_expert_indices, gating_output,)
+        # 2. Re-implement:  add e_score_correction_bias before softmax 
+        routing_weights = router_logits.softmax(dim=-1, dtype=torch.float32)
+        routing_weights_with_bias = routing_weights + e_score_correction_bias.unsqueeze(0)
+        _, topk_ids = torch.topk(routing_weights_with_bias, top_k, dim=-1)
+        topk_weights = routing_weights.gather(1, topk_ids)
+
+        if renormalize:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+        # print(f"in FusedMoE, routing_weights_with_bias: {routing_weights_with_bias.shape} {routing_weights_with_bias.dtype} {routing_weights_with_bias}")
+        # print(f"in FusedMoE, routing_weights: {routing_weights.shape} {routing_weights.dtype} {routing_weights}")
+        # print(f"in FusedMoE, re-implement topk_weights: {topk_weights.shape} {topk_weights.dtype} {topk_weights}")
+        # print(f"in FusedMoE, re-implement topk_ids: {topk_ids.shape} {topk_ids.dtype} {topk_ids}")
 
         return topk_weights, topk_ids
 
@@ -1352,6 +1386,9 @@ class FusedMoE(torch.nn.Module):
 
     def forward(self, hidden_states: torch.Tensor,
                 router_logits: torch.Tensor):
+        # print(f"in FusedMoE, self.use_direct_call:{self.use_direct_call}, self.forward_impl:{self.forward_impl}")
+        # self.use_direct_call:True
+        # self.forward_impl:<bound method FusedMoE.forward_impl of FusedMoE(global_num_experts=64, local_num_experts=64, top_k=8, intermediate_size_per_partition=3584, tp_size=1, ep_size=1, reduce_results=False, renormalize=False, use_grouped_topk=False, scoring_func='softmax', activation='silu' (quant_method): UnquantizedFusedMoEMethod()
         if self.use_direct_call:
             return self.forward_impl(hidden_states, router_logits)
         else:
@@ -1445,6 +1482,7 @@ class FusedMoE(torch.nn.Module):
                 hidden_states, router_logits)
 
         # Matrix multiply.
+        # print(f"in FusedMoE, self.reduce_results:{self.reduce_results} do_naive_dispatch_combine:{do_naive_dispatch_combine}")
         final_hidden_states = self.quant_method.apply(
             layer=self,
             x=hidden_states,

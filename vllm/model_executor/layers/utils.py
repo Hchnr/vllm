@@ -93,3 +93,10 @@ def dispatch_unquantized_gemm() -> Callable[..., torch.Tensor]:
     if current_platform.is_rocm():
         return rocm_unquantized_gemm
     return torch.nn.functional.linear
+
+
+def dispatch_unquantized_gemm_paddle() -> Callable[..., torch.Tensor]:
+    if current_platform.is_rocm():
+        return rocm_unquantized_gemm
+    import paddle
+    return paddle.nn.functional.linear

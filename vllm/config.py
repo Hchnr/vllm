@@ -4752,3 +4752,25 @@ def get_layers_from_vllm_config(vllm_config: VllmConfig,
         vllm_config.compilation_config.static_forward_context.items()
         if isinstance(layer, layer_type)
     }
+
+
+tmp_tensors = {}
+from safetensors import safe_open
+FILE = "/share/project/hcr/test/wenxinyiyan/tmp_tensors/tmp_tensors_l4.pt"
+
+# with safe_open(FILE, framework="pt") as f:
+#     for key in f.keys():
+#         tensor = f.get_tensor(key)
+#         tmp_tensors[key] = tensor.cuda()
+
+new_tmp_tensors = {}
+is_debug_start = False
+
+
+'''
+import pickle
+fd_config = None
+with open("/share/project/hcr/models/wenxinyiyan/inference0623/FastDeploy/fd_config.pkl", 'rb') as f:
+    fd_config = pickle.load(f)
+print(f"fd_config: {fd_config}")
+'''

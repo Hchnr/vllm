@@ -17,7 +17,7 @@ from vllm.distributed import (divide, get_tensor_model_parallel_rank,
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
-from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
+from vllm.model_executor.layers.utils import dispatch_unquantized_gemm, dispatch_unquantized_gemm_paddle
 # yapf: disable
 from vllm.model_executor.parameter import (BasevLLMParameter,
                                            BlockQuantScaleParameter,
@@ -199,8 +199,30 @@ class UnquantizedLinearMethod(LinearMethodBase):
               layer: torch.nn.Module,
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-
         return dispatch_unquantized_gemm()(x, layer.weight, bias)
+        # return dispatch_unquantized_gemm_paddle()(pt2paddle(x), pt2paddle(layer.weight).transpose(-2,-1), pt2paddle(bias))
+
+def paddle2torch(x):
+    if x is None:
+        return x
+    
+    idx = x.device.index
+    import paddle
+    if x.dtype == torch.bfloat16:
+        return paddle.to_tensor(x.cpu().view(torch.uint16).numpy(), dtype=paddle.bfloat16).cuda(idx)
+    else:
+        return paddle.to_tensor(x.cpu().numpy()).cuda(idx)
+
+def torch2paddle(x):
+    if x is None:
+        return x
+    
+    idx = x.device.index
+    import paddle
+    if x.dtype == torch.bfloat16:
+        return paddle.to_tensor(x.cpu().view(torch.uint16).numpy(), dtype=paddle.bfloat16).cuda(idx)
+    else:
+        return paddle.to_tensor(x.cpu().numpy()).cuda(idx)
 
 
 class LinearBase(torch.nn.Module):
@@ -323,7 +345,8 @@ class ReplicatedLinear(LinearBase):
 
         assert param.size() == loaded_weight.size(), (
             f"Tried to load weights of size {loaded_weight.size()}"
-            f"to a parameter of size {param.size()}")
+            f"to a parameter of size {param.size()}, {self._modules}")
+
         param.data.copy_(loaded_weight)
 
     def forward(

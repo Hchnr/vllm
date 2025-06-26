@@ -717,6 +717,7 @@ class LLMEngine:
             lora_request=lora_request,
             prompt_adapter_request=prompt_adapter_request,
         )
+        logger.info(f"in LLMEngine.add_request() processed_inputs: {processed_inputs}")
 
         self._add_processed_request(
             request_id=request_id,

@@ -56,6 +56,7 @@ from .interfaces import SupportsPP
 from .utils import (PPMissingLayer, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix, extract_layer_index)
+from vllm.config import tmp_tensors, new_tmp_tensors, is_debug_start
 
 
 class ErnieMLP(nn.Module):
@@ -68,6 +69,7 @@ class ErnieMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         prefix: str = "",
+        layer_idx: int = 0,
     ) -> None:
         super().__init__()
         self.up_gate_proj = MergedColumnParallelLinear(
@@ -76,6 +78,7 @@ class ErnieMLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.up_gate_proj")
         # print(f"in ErnieMLP quant_config {prefix}: {quant_config}")
+        self.layer_idx = layer_idx
         self.down_proj = RowParallelLinear(intermediate_size,
                                            hidden_size,
                                            bias=False,
@@ -89,10 +92,14 @@ class ErnieMLP(nn.Module):
 
     def forward(self, x, layer_idx=None):
         # print(f"in ErnieMLP input: {x.shape} {x}")
+        key = f"model.layer[{self.layer_idx}].mlp"
         gate_up, _ = self.up_gate_proj(x)
 
+        if is_debug_start:
+            new_tmp_tensors[f"{key}.gate_up_out"] = gate_up.clone()
+            gate_up = tmp_tensors[f"{key}.gate_up_out"]
+
         '''
-        
         if gate_up.shape[0] == 13 and layer_idx == 0:
             torch.save(gate_up, f"up_out_layer_0.pt")
             print("save up_out.")
@@ -102,6 +109,11 @@ class ErnieMLP(nn.Module):
 
         # print(f"in ErnieMLP up_gate_out: {gate_up.shape} {gate_up}")
         x = self.act_fn(gate_up)
+
+        if is_debug_start:
+            new_tmp_tensors[f"{key}.act_out"] = x.clone()
+            x = tmp_tensors[f"{key}.act_out"]
+
         # print(f"in ErnieMLP act_out: {x.shape} {x}")
         x, _ = self.down_proj(x)
         # print(f"in ErnieMLP down_out: {x.shape} {x}")
@@ -129,10 +141,11 @@ class ErnieMoE(nn.Module):
                                      config.n_routed_experts,
                                      bias=False,
                                      quant_config=None,
-                                     prefix=f"{prefix}.gate")
+                                     prefix=f"{prefix}.gate",
+                                     params_dtype=torch.float32)
         if config.topk_method == "noaux_tc":
             self.gate.e_score_correction_bias = nn.Parameter(
-                torch.empty(config.n_routed_experts))
+                torch.empty(config.n_routed_experts, dtype=torch.float32))
         else:
             self.gate.e_score_correction_bias = None
 
@@ -144,7 +157,7 @@ class ErnieMoE(nn.Module):
             reduce_results=False,
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
-            use_grouped_topk=True,
+            use_grouped_topk=False,
             num_expert_group=config.n_group,
             topk_group=config.topk_group,
             prefix=f"{prefix}.experts",
@@ -152,10 +165,19 @@ class ErnieMoE(nn.Module):
             e_score_correction_bias=self.gate.e_score_correction_bias)
 
     def forward(self, hidden_states: torch.Tensor, layer_idx=None) -> torch.Tensor:
+        # print(f"layer-{layer_idx} ErnieMoE input: {hidden_states.shape} {hidden_states}")
+        key = "moe"
+
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        router_logits, _ = self.gate(hidden_states.to(torch.float32))
+
+        if is_debug_start:
+            new_tmp_tensors[f"{key}.gate_out"] = router_logits.clone()
+            router_logits = tmp_tensors[f"{key}.gate_out"]
+
+        # print(f"layer-{layer_idx} ErnieMoE gate: {router_logits.shape} {router_logits}")
 
         if hidden_states.dtype != torch.float16:
             final_hidden_states = self.experts(
@@ -166,6 +188,7 @@ class ErnieMoE(nn.Module):
             # See ErnieDecoderLayer for more details.
             final_hidden_states = self.experts(hidden_states=hidden_states,
                                                router_logits=router_logits)
+        # print(f"layer-{layer_idx} ErnieMoE experts output: {final_hidden_states.view(num_tokens, hidden_dim).shape} {final_hidden_states.view(num_tokens, hidden_dim)}")
 
         if self.tp_size > 1:
             final_hidden_states = (
@@ -287,8 +310,17 @@ class ErnieAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        print(f"in ernie attentino is_debug_start: {is_debug_start}")
         qkv, _ = self.qkv_proj(hidden_states)
+
+        key = f"model.layer[{self.layer_idx}].self_attn"
+        if is_debug_start:
+            new_tmp_tensors[f"{key}.qkv"] = qkv.clone()
+            qkv = tmp_tensors[f"{key}.qkv"]
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        print(f"in ErnieAttention qkv:  {q.shape} {k.shape} {v.shape}")
 
         if self.rotary_emb is not None:
             q, k = self.rotary_emb(positions, q, k)
@@ -310,7 +342,17 @@ class ErnieAttention(nn.Module):
             attn_scale = self._get_attn_scale(positions)
             q = (q * attn_scale).to(q.dtype)
         attn_output = self.attn(q, k, v)
+
+        if is_debug_start:
+            new_tmp_tensors[f"{key}.attn_out"] = attn_output.clone()
+            attn_output = tmp_tensors[f"{key}.attn_out"]
+
+        # if self.layer_idx == 0:
+        #     print(f"in ErnieAttention attn_output:  {attn_output.shape} {attn_output.dtype} {attn_output}")
         output, _ = self.o_proj(attn_output)
+
+        # if self.layer_idx == 0:
+        #     print(f"in ErnieAttention output:  {output.shape} {output.dtype} {output}")
         return output
 
 
@@ -366,6 +408,7 @@ class ErnieDecoderLayer(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
+                layer_idx=layer_idx,
             )
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
@@ -379,23 +422,45 @@ class ErnieDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        # print(f"layer-{self.layer_idx} input: {hidden_states.shape})")
-        # print(f"layer-{self.layer_idx} input: {hidden_states.shape} {hidden_states})")
+        print(f"layer-{self.layer_idx} hidden_states in: {hidden_states.device}")
+
+        key = f"model.layer[{self.layer_idx}]"
+        if is_debug_start:
+            new_tmp_tensors[f"{key}.input"] = hidden_states.clone()
+            hidden_states = tmp_tensors[f"{key}.input"]
 
         # Self Attention
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
+            if is_debug_start:
+                new_tmp_tensors[f"{key}.input_residual"] = residual.clone()
+                residual = tmp_tensors[f"{key}.input_residual"]
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
+            if is_debug_start:
+                new_tmp_tensors[f"{key}.residual_norm"] = residual.clone()
+                residual = tmp_tensors[f"{key}.residual_norm"]
+
+        print(f"layer-{self.layer_idx} hidden_states in_norm: {hidden_states.device}")
+        print(f"layer-{self.layer_idx} residual in_norm: {residual.device}")
+            
+        if is_debug_start:
+            new_tmp_tensors[f"{key}.input_norm"] = hidden_states.clone()
+            hidden_states = tmp_tensors[f"{key}.input_norm"]
+            
             
         # print(f"layer-{self.layer_idx} input_norm: {hidden_states.shape} {hidden_states})")
+        # print(f"layer-{self.layer_idx} input_norm: {self.input_layernorm.__dict__})")
 
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
+        if is_debug_start:
+            new_tmp_tensors[f"{key}.self_attn"] = hidden_states.clone()
+            hidden_states = tmp_tensors[f"{key}.self_attn"]
 
         # print(f"layer-{self.layer_idx} self_attn: {hidden_states.shape} {hidden_states})")
 
@@ -409,13 +474,29 @@ class ErnieDecoderLayer(nn.Module):
                 # first layer.
                 residual *= 1. / self.routed_scaling_factor
 
+        print(f"layer-{self.layer_idx} hidden_states attn: {hidden_states.device}")
+        print(f"layer-{self.layer_idx} residual attn: {residual.device}")
+
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
         
+        if is_debug_start:
+            new_tmp_tensors[f"{key}.post_norm"] = hidden_states.clone()
+            hidden_states = tmp_tensors[f"{key}.post_norm"]
+            new_tmp_tensors[f"{key}.post_norm_residual"] = residual.clone()
+            residual = tmp_tensors[f"{key}.post_norm_residual"]
+        
         # print(f"layer-{self.layer_idx} post_norm: {hidden_states.shape} {hidden_states})")
 
+        print(f"layer-{self.layer_idx} hidden_states post_norm: {hidden_states.device}")
+        print(f"layer-{self.layer_idx} residual post_norm: {residual.device}")
+
         hidden_states = self.mlp(hidden_states, layer_idx=self.layer_idx)
+        if is_debug_start:
+            new_tmp_tensors[f"{key}.mlp"] = hidden_states.clone()
+            hidden_states = tmp_tensors[f"{key}.mlp"]
+
 
         if isinstance(self.mlp,
                       ErnieMLP) and hidden_states.dtype == torch.float16:
@@ -469,8 +550,10 @@ class ErnieModel(nn.Module):
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.layer_norm = ErnieLayerNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+            self.layer_norm = PPMissingLayer()
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"], config.hidden_size))
@@ -485,6 +568,18 @@ class ErnieModel(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = True
+        
+        key = "model"
+        print(f"input_ids.shape: {input_ids.shape}")
+        if input_ids.shape[0] == 13:
+            global is_debug_start
+            is_debug_start = False
+            # new_tmp_tensors[f"{key}.token_id"] = input_ids.clone()
+            # input_ids = tmp_tensors[f"{key}.token_id"]
+        
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -496,13 +591,17 @@ class ErnieModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        if is_debug_start:
+            new_tmp_tensors[f"{key}.embeddings"] = hidden_states.clone()
+            hidden_states = tmp_tensors[f"{key}.embeddings"]
+
         layer_idx = 0
         for layer in self.layers[self.start_layer:self.end_layer]:
             # print(f"layer-{layer_idx} input hidden_states: {hidden_states.shape} {hidden_states}")
             
             hidden_states, residual = layer(positions, hidden_states, residual)
 
-            # print(f"layer-{layer_idx} output hidden_states: {hidden_states.shape} {hidden_states}")
+            print(f"layer-{layer_idx} output hidden_states: {hidden_states.shape} {hidden_states}")
             layer_idx += 1
 
         if not get_pp_group().is_last_rank:
@@ -510,9 +609,37 @@ class ErnieModel(nn.Module):
                 "hidden_states": hidden_states,
                 "residual": residual
             })
+        
+        # hidden_states, _ = self.layer_norm(hidden_states, residual)
+        hidden_states = hidden_states + residual
+        if is_debug_start:
+            new_tmp_tensors[f"{key}.last_layernorm"] = hidden_states.clone()
+            hidden_states = tmp_tensors[f"{key}.last_layernorm"]
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        # hidden_states, _ = self.norm(hidden_states, residual)
+        hidden_states = self.norm(hidden_states)
+        if is_debug_start:
+            new_tmp_tensors[f"{key}.out"] = hidden_states.clone()
+            hidden_states = tmp_tensors[f"{key}.out"]
+
+        from safetensors.torch import save_file
+        save_file(new_tmp_tensors, "new_tmp_tensors_l4.pt")
+
         return hidden_states
+
+
+class ErnieLayerNorm(nn.Module):
+    """LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False."""
+
+    def __init__(self, hidden_size, eps=1e-5, bias=False):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.bias = nn.Parameter(torch.zeros(hidden_size)) if bias else None
+        self.eps = eps
+
+    def forward(self, input):
+        from torch.nn import functional as F
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, self.eps)
 
 
 class ErnieForCausalLM(nn.Module, SupportsPP):
