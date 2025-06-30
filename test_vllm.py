@@ -19,11 +19,12 @@ sampling_params = SamplingParams(seed=0, temperature=0.0001, top_p=0.8, max_toke
 
 def test_all():
     MODEL_PATH = "/share/project/hcr/models/wenxinyiyan/ernie45T-trans"
-    llm = LLM(model=MODEL_PATH, trust_remote_code=True, tensor_parallel_size=8, gpu_memory_utilization=0.95, max_model_len=1024, enforce_eager=True)
+    llm = LLM(model=MODEL_PATH, trust_remote_code=True, tensor_parallel_size=8, gpu_memory_utilization=0.98, max_model_len=1024, enforce_eager=True)
     sampling_params = SamplingParams(seed=0, temperature=0.0001, top_p=0.8, max_tokens=1)
 
     input_token_ids = [100273, 2969, 93963, 93919, 16276, 93938, 851, 853, 357, 23, 92267, 93963, 93919]
     outputs2 = llm.generate(prompt_token_ids=[input_token_ids], sampling_params=sampling_params)
+    # outputs = llm.generate(prompts, sampling_params)
 
     import pdb; pdb.set_trace()
 
@@ -42,7 +43,7 @@ def test_all():
 
 def test_4l():
     MODEL_PATH = "/share/project/hcr/models/wenxinyiyan/ernie34T-4l_torch_split"
-    llm = LLM(model=MODEL_PATH, trust_remote_code=True, tensor_parallel_size=2, gpu_memory_utilization=0.8, max_model_len=40960, enforce_eager=True)
+    llm = LLM(model=MODEL_PATH, trust_remote_code=True, tensor_parallel_size=1, gpu_memory_utilization=0.8, max_model_len=40960, enforce_eager=True)
     '''
     outputs = llm.generate(prompts, sampling_params)
     print("\nGenerated Outputs:\n" + "-" * 60)

@@ -99,13 +99,13 @@ class ErnieMLP(nn.Module):
             new_tmp_tensors[f"{key}.gate_up_out"] = gate_up.clone()
             gate_up = tmp_tensors[f"{key}.gate_up_out"]
 
-        '''
-        if gate_up.shape[0] == 13 and layer_idx == 0:
-            torch.save(gate_up, f"up_out_layer_0.pt")
-            print("save up_out.")
-            print(f"in ErnieMLP up_gate_weights: {self.up_gate_proj.weight.shape} {self.up_gate_proj.weight}")
-            print(f"in ErnieMLP up_gate_weights: {self.up_gate_proj.state_dict()}")
-        '''
+        
+        # if gate_up.shape[0] == 13 and layer_idx == 0:
+        # torch.save(gate_up, f"up_out_layer_0.pt")
+        # print("save up_out.")
+        print(f"in ErnieMLP up_gate_weights: {self.up_gate_proj.weight.shape} {self.up_gate_proj.weight}")
+        print(f"in ErnieMLP up_gate_weights: {self.up_gate_proj.state_dict()}")
+        
 
         # print(f"in ErnieMLP up_gate_out: {gate_up.shape} {gate_up}")
         x = self.act_fn(gate_up)
@@ -622,8 +622,18 @@ class ErnieModel(nn.Module):
             new_tmp_tensors[f"{key}.out"] = hidden_states.clone()
             hidden_states = tmp_tensors[f"{key}.out"]
 
-        from safetensors.torch import save_file
-        save_file(new_tmp_tensors, "new_tmp_tensors_l4.pt")
+        print(f"new_tmp_tensors: {new_tmp_tensors.keys()}")
+        print(f"tmp_tensors: {tmp_tensors.keys()}")
+        # from safetensors.torch import save_file
+        # save_file(new_tmp_tensors, "new_tmp_tensors_l4.pt")
+
+        if False and hidden_states.shape[0] == 13:
+            from safetensors import safe_open
+            with safe_open("/share/project/hcr/models/wenxinyiyan/inference0610/FastDeploy/last_hidden_states.pt", framework="pt") as f:
+                idx = hidden_states.device.index
+                print(f"last_hidden_states before: {hidden_states}")
+                hidden_states = f.get_tensor("last_hidden_states").cuda(idx)
+                print(f"last_hidden_states after: {hidden_states}")
 
         return hidden_states
 
@@ -686,6 +696,8 @@ class ErnieForCausalLM(nn.Module, SupportsPP):
     ) -> Optional[torch.Tensor]:
         logits = self.logits_processor(self.lm_head, hidden_states,
                                        sampling_metadata)
+        print(f"logits: {logits}")
+        print(f"topk: {logits[0].topk(8)}")
         return logits
 
     def make_empty_intermediate_tensors(
