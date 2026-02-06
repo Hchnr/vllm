@@ -172,9 +172,8 @@ def _fused_rms_norm_gemm_kernel(
     tl.store(out_ptrs, c, mask=out_mask)
 
 
-def _get_autotune_config():
-    """Get autotuning configurations for the GEMM kernel."""
-    return [
+@triton.autotune(
+    configs=[
         triton.Config(
             {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
             num_stages=3,
@@ -195,7 +194,239 @@ def _get_autotune_config():
             num_stages=3,
             num_warps=8,
         ),
-    ]
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def _true_fused_rms_norm_gemm_kernel(
+    # Input tensors
+    X,  # [M, K] input (already normalized: x + residual if applicable)
+    W,  # [N, K] weight matrix
+    NormWeight,  # [K] RMSNorm weight
+    Rstd,  # [M] precomputed rstd
+    Out,  # [M, N] output
+    Bias,  # [N] optional bias
+    # Dimensions
+    M: tl.int64,
+    K: tl.int64,
+    N: tl.int64,
+    # Strides
+    stride_xm: tl.int64,
+    stride_xk: tl.int64,
+    stride_wn: tl.int64,
+    stride_wk: tl.int64,
+    stride_om: tl.int64,
+    stride_on: tl.int64,
+    # Compile-time constants
+    HAS_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    INPUT_DTYPE: tl.constexpr,
+):
+    """
+    Fused RMSNorm + GEMM kernel (Phase 2 of two-phase approach).
+
+    Computes: Out = RMSNorm(X, NormWeight, Rstd) @ W.T + Bias
+    Where rstd is precomputed in phase 1.
+
+    Grid: (num_pid_m * num_pid_n,)
+    """
+    # Program ID and grid mapping (swizzled for L2 cache)
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # Block offsets
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Load rstd for this block's rows
+    rstd = tl.load(Rstd + offs_m, mask=offs_m < M, other=1.0)
+
+    # Initialize accumulator
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Main GEMM loop with fused RMSNorm
+    for k_start in range(0, K, BLOCK_K):
+        k_offs = k_start + offs_k
+        k_mask = k_offs < K
+
+        # Load X block [BLOCK_M, BLOCK_K]
+        x_ptrs = X + offs_m[:, None] * stride_xm + k_offs[None, :] * stride_xk
+        x = tl.load(
+            x_ptrs,
+            mask=(offs_m[:, None] < M) & (k_mask[None, :]),
+            other=0.0,
+        ).to(tl.float32)
+
+        # Load norm weight
+        norm_w = tl.load(NormWeight + k_offs, mask=k_mask, other=1.0).to(tl.float32)
+
+        # Apply RMSNorm on-the-fly
+        x_normed = x * rstd[:, None] * norm_w[None, :]
+        x_normed = x_normed.to(INPUT_DTYPE).to(tl.float32)
+
+        # Load W block [BLOCK_K, BLOCK_N]
+        w_ptrs = W + offs_n[None, :] * stride_wn + k_offs[:, None] * stride_wk
+        w = tl.load(
+            w_ptrs,
+            mask=(k_mask[:, None]) & (offs_n[None, :] < N),
+            other=0.0,
+        ).to(tl.float32)
+
+        # GEMM accumulate
+        accumulator += tl.dot(x_normed, w)
+
+    # Add bias
+    if HAS_BIAS:
+        bias_val = tl.load(Bias + offs_n, mask=offs_n < N, other=0.0).to(tl.float32)
+        accumulator += bias_val[None, :]
+
+    # Store output
+    c = accumulator.to(Out.dtype.element_ty)
+    out_ptrs = Out + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(out_ptrs, c, mask=out_mask)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+            num_stages=3,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+            num_stages=3,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+            num_stages=3,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+            num_stages=3,
+            num_warps=8,
+        ),
+        triton.Config(
+            {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 64, "GROUP_SIZE_M": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def _fused_rms_norm_gemm_kernel_autotuned(
+    # Input tensors
+    X,  # [M, K] input (or residual after fused add)
+    W,  # [N, K] weight matrix (transposed for row-major)
+    NormWeight,  # [K] RMSNorm weight
+    Rstd,  # [M] precomputed rstd
+    Out,  # [M, N] output
+    Bias,  # [N] optional bias
+    # Dimensions
+    M: tl.int64,
+    K: tl.int64,
+    N: tl.int64,
+    # Strides
+    stride_xm: tl.int64,
+    stride_xk: tl.int64,
+    stride_wn: tl.int64,
+    stride_wk: tl.int64,
+    stride_om: tl.int64,
+    stride_on: tl.int64,
+    # Compile-time constants
+    HAS_BIAS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    INPUT_DTYPE: tl.constexpr,
+):
+    """
+    Autotuned fused RMSNorm + GEMM kernel.
+    """
+    # Program ID and grid mapping (swizzled for better L2 cache utilization)
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # Compute block offsets
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Load rstd for this block of rows
+    rstd = tl.load(Rstd + offs_m, mask=offs_m < M, other=1.0)
+
+    # Initialize accumulator
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Main GEMM loop
+    for k_start in range(0, K, BLOCK_K):
+        k_offs = k_start + offs_k
+        k_mask = k_offs < K
+
+        # Load X block: [BLOCK_M, BLOCK_K]
+        x_ptrs = X + offs_m[:, None] * stride_xm + k_offs[None, :] * stride_xk
+        x = tl.load(
+            x_ptrs,
+            mask=(offs_m[:, None] < M) & (k_mask[None, :]),
+            other=0.0,
+        ).to(tl.float32)
+
+        # Load norm weight: [BLOCK_K]
+        norm_w = tl.load(NormWeight + k_offs, mask=k_mask, other=1.0).to(tl.float32)
+
+        # Apply RMSNorm: x_normed = x * rstd * norm_weight
+        x_normed = x * rstd[:, None] * norm_w[None, :]
+        x_normed = x_normed.to(INPUT_DTYPE).to(tl.float32)
+
+        # Load W block: [BLOCK_K, BLOCK_N]
+        w_ptrs = W + offs_n[None, :] * stride_wn + k_offs[:, None] * stride_wk
+        w = tl.load(
+            w_ptrs,
+            mask=(k_mask[:, None]) & (offs_n[None, :] < N),
+            other=0.0,
+        ).to(tl.float32)
+
+        # Accumulate
+        accumulator += tl.dot(x_normed, w)
+
+    # Add bias if present
+    if HAS_BIAS:
+        bias = tl.load(Bias + offs_n, mask=offs_n < N, other=0.0).to(tl.float32)
+        accumulator += bias[None, :]
+
+    # Convert to output dtype and store
+    c = accumulator.to(Out.dtype.element_ty)
+    out_ptrs = Out + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(out_ptrs, c, mask=out_mask)
 
 
 def fused_rms_norm_linear(
@@ -207,7 +438,7 @@ def fused_rms_norm_linear(
     bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
-    Fused RMSNorm + Linear operation.
+    Fused RMSNorm + Linear operation using true single-kernel fusion.
 
     If residual is provided:
         residual = x + residual  (in-place update)
@@ -243,7 +474,8 @@ def fused_rms_norm_linear(
         if not residual_2d.is_contiguous():
             residual_2d = residual_2d.contiguous()
     else:
-        residual_2d = None
+        # Create dummy residual for kernel (won't be used)
+        residual_2d = x_2d
 
     # Ensure weight is contiguous
     if not linear_weight.is_contiguous():
@@ -255,18 +487,18 @@ def fused_rms_norm_linear(
     rstd = torch.empty(M, dtype=torch.float32, device=x.device)
     out = torch.empty((M, N), dtype=x.dtype, device=x.device)
 
-    # Determine block size for rstd kernel
-    BLOCK_K_RSTD = min(triton.next_power_of_2(K), 8192)
-
-    # Launch rstd computation kernel
-    grid_rstd = (M,)
     input_dtype = tl.bfloat16 if x.dtype == torch.bfloat16 else tl.float16
+
+    # Phase 1: Compute rstd (and handle residual addition)
+    BLOCK_K_RSTD = min(triton.next_power_of_2(K), 8192)
+    grid_rstd = (M,)
+
     _fused_add_rms_norm_rstd_kernel[grid_rstd](
-        x_2d if not has_residual else x_2d,
-        residual_2d if has_residual else x_2d,  # dummy if no residual
+        x_2d,
+        residual_2d,
         rstd,
         x_2d.stride(0),
-        residual_2d.stride(0) if has_residual else x_2d.stride(0),
+        residual_2d.stride(0),
         M,
         K,
         eps,
@@ -276,29 +508,15 @@ def fused_rms_norm_linear(
         num_warps=min(max(BLOCK_K_RSTD // 256, 1), 8),
     )
 
-    # For GEMM, use the residual (which now contains x + residual) if available
+    # For GEMM, use residual (now contains x + residual) if applicable
     gemm_input = residual_2d if has_residual else x_2d
 
-    # GEMM kernel configuration
-    BLOCK_M = 64
-    BLOCK_N = 64
-    BLOCK_K = 64
-    GROUP_SIZE_M = 8
-    num_stages = 3
-    num_warps = 4
-
-    # Adjust for larger matrices
-    if M >= 256 and N >= 256:
-        BLOCK_M = 128
-        BLOCK_N = 128
-        num_warps = 8
-
-    # Launch GEMM kernel
+    # Phase 2: Fused RMSNorm + GEMM
     grid_gemm = lambda META: (  # noqa: E731
         triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
     )
 
-    _fused_rms_norm_gemm_kernel[grid_gemm](
+    _true_fused_rms_norm_gemm_kernel[grid_gemm](
         gemm_input,
         linear_weight,
         norm_weight,
@@ -315,13 +533,7 @@ def fused_rms_norm_linear(
         out.stride(0),
         out.stride(1),
         HAS_BIAS=bias is not None,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-        GROUP_SIZE_M=GROUP_SIZE_M,
         INPUT_DTYPE=input_dtype,
-        num_stages=num_stages,
-        num_warps=num_warps,
     )
 
     # Reshape output
