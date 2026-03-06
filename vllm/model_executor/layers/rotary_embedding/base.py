@@ -296,6 +296,36 @@ class RotaryEmbedding(RotaryEmbeddingBase):
         )
         return query, key
 
+    def forward_fused_split_rope(
+        self,
+        positions: torch.Tensor,
+        qkv: torch.Tensor,
+        num_heads_q: int,
+        num_heads_kv: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply RoPE in-place to Q/K portions of fused QKV tensor,
+        then split and return q, k, v."""
+        from vllm import _custom_ops as ops
+
+        cos_sin_cache = self._match_cos_sin_cache_dtype(qkv)
+
+        # ops.fused_split_rope() is an in-place operation
+        # that applies RoPE to Q and K portions of the QKV tensor.
+        ops.fused_split_rope(
+            qkv,
+            positions,
+            num_heads_q,
+            num_heads_kv,
+            self.head_size,
+            cos_sin_cache,
+            self.is_neox_style,
+        )
+
+        q_size = num_heads_q * self.head_size
+        kv_size = num_heads_kv * self.head_size
+        q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+        return q, k, v
+
     def extra_repr(self) -> str:
         s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
         s += f", max_position_embeddings={self.max_position_embeddings}"

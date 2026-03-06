@@ -326,6 +326,21 @@ def rotary_embedding(
     )
 
 
+def fused_split_rope(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    num_heads_q: int,
+    num_heads_kv: int,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+) -> None:
+    torch.ops._C.fused_split_rope(
+        qkv, positions, num_heads_q, num_heads_kv,
+        head_size, cos_sin_cache, is_neox
+    )
+
+
 # layer norm ops
 def rms_norm(
     out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor, epsilon: float
