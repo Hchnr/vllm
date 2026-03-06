@@ -98,6 +98,11 @@ void fused_qk_norm_rope(torch::Tensor& qkv, int64_t num_heads_q,
                         torch::Tensor& k_weight, torch::Tensor& cos_sin_cache,
                         bool is_neox, torch::Tensor& position_ids);
 
+void fused_split_rope(torch::Tensor& qkv, torch::Tensor& positions,
+                      int64_t num_heads_q, int64_t num_heads_kv,
+                      int64_t head_size, torch::Tensor& cos_sin_cache,
+                      bool is_neox);
+
 void apply_repetition_penalties_(torch::Tensor& logits,
                                  const torch::Tensor& prompt_mask,
                                  const torch::Tensor& output_mask,

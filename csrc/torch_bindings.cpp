@@ -237,6 +237,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "                 Tensor cos_sin_cache, bool is_neox) -> ()");
   ops.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
 
+  // Fused split + rotary embedding
+  // Apply RoPE in-place to Q and K portions of a fused QKV tensor.
+  ops.def(
+      "fused_split_rope(Tensor! qkv, Tensor positions,"
+      "                 int num_heads_q, int num_heads_kv,"
+      "                 int head_size, Tensor cos_sin_cache,"
+      "                 bool is_neox) -> ()");
+  ops.impl("fused_split_rope", torch::kCUDA, &fused_split_rope);
+
   // Quantization ops
 #ifndef USE_ROCM
   // DeepSeek V3 fused A GEMM (SM 9.0+, bf16 only, 1-16 tokens).

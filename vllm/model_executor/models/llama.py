@@ -225,8 +225,8 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+        q, k, v = self.rotary_emb.forward_fused_split_rope(
+            positions, qkv, self.num_heads, self.num_kv_heads)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
